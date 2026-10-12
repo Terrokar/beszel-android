@@ -1,8 +1,37 @@
+import 'dart:async';
+import 'dart:math' as math;
+
+import 'package:beszel_pro/models/records.dart';
+import 'package:beszel_pro/models/stats.dart';
 import 'package:beszel_pro/models/system.dart';
+import 'package:beszel_pro/services/beszel_api.dart';
 import 'package:beszel_pro/services/pocketbase_service.dart';
-import 'package:fl_chart/fl_chart.dart';
-import 'package:flutter/material.dart';
+import 'package:beszel_pro/utils/format.dart';
+import 'package:beszel_pro/widgets/common.dart';
+import 'package:beszel_pro/widgets/time_series_chart.dart';
 import 'package:easy_localization/easy_localization.dart';
+import 'package:flutter/material.dart';
+import 'package:pocketbase/pocketbase.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+enum _Tab {
+  overview(Icons.dashboard_outlined),
+  cpu(Icons.memory),
+  memory(Icons.storage),
+  disk(Icons.disc_full),
+  network(Icons.swap_vert),
+  sensors(Icons.thermostat),
+  gpu(Icons.videogame_asset_outlined),
+  containers(Icons.view_in_ar_outlined),
+  services(Icons.miscellaneous_services),
+  smart(Icons.health_and_safety_outlined);
+
+  final IconData icon;
+  const _Tab(this.icon);
+
+  bool get hasCharts =>
+      this != _Tab.containers && this != _Tab.services && this != _Tab.smart;
+}
 
 class SystemDetailScreen extends StatefulWidget {
   final System system;
@@ -14,863 +43,1510 @@ class SystemDetailScreen extends StatefulWidget {
 }
 
 class _SystemDetailScreenState extends State<SystemDetailScreen> {
-  // Selected category: 0=CPU, 1=Memory, 2=Disk, 3=Network
-  int _selectedCategory = 0;
+  static const _rangePrefKey = 'chart_range';
 
-  // Chart data
-  List<FlSpot> _cpuSpots = [];
-  List<FlSpot> _ramSpots = [];
-  List<FlSpot> _diskSpots = [];
-  List<FlSpot> _netSpots = [];
+  final _api = BeszelApi();
 
-  // Latest stats from system_stats
-  Map<String, dynamic>? _latestStats;
+  late System _system = widget.system;
+  SystemDetails? _details;
+  ChartRange _range = ChartRange.hour;
+  List<StatsPoint> _points = [];
+  List<ContainerInfo> _containers = [];
+  List<SystemdService> _services = [];
+  List<SmartDevice> _smart = [];
 
-  // Per-core CPU usage
-  List<int> _cpuCoresUsage = [];
+  bool _initialLoading = true;
+  bool _historyLoading = false;
+  String? _error;
+  bool _smartRefreshing = false;
 
-  bool _isLoading = true;
+  UnsubscribeFunc? _systemUnsub;
+  UnsubscribeFunc? _liveUnsub;
+  Timer? _refreshTimer;
+  int _historyRequest = 0;
+
+  String _serviceFilter = '';
 
   @override
   void initState() {
     super.initState();
-    _fetchHistory();
-    _subscribeToRealtime();
+    _init();
   }
 
   @override
   void dispose() {
-    _unsubscribeFromRealtime();
+    _refreshTimer?.cancel();
+    _systemUnsub?.call().catchError((_) {});
+    _liveUnsub?.call().catchError((_) {});
     super.dispose();
   }
 
-  Future<void> _subscribeToRealtime() async {
+  bool get _liveSupported =>
+      _system.isUp && versionAtLeast(_system.agentVersion, '0.13.0');
+
+  Future<void> _init() async {
+    final prefs = await SharedPreferences.getInstance();
+    var range = ChartRange.fromLabel(prefs.getString(_rangePrefKey));
+    if (range == ChartRange.live && !_liveSupported) range = ChartRange.hour;
+    _range = range;
+
+    _subscribeSystem();
+    await Future.wait([
+      _loadHistory(),
+      _loadDetails(),
+      _loadContainers(),
+      _loadServices(),
+      _loadSmart(),
+    ]);
+    if (mounted) setState(() => _initialLoading = false);
+    _applyRange();
+  }
+
+  Future<void> _subscribeSystem() async {
     try {
-      final pb = PocketBaseService().pb;
-      await pb.collection('systems').subscribe(widget.system.id, (e) {
-        if (!mounted) return;
-        if (e.action == 'update') {
-          final updatedSystem = System.fromRecord(e.record!);
-          final now = DateTime.now().millisecondsSinceEpoch.toDouble();
-
-          setState(() {
-            _addSpot(_cpuSpots, now, updatedSystem.cpuPercent);
-            _addSpot(_ramSpots, now, updatedSystem.memoryPercent);
-            _addSpot(_diskSpots, now, updatedSystem.diskPercent);
-
-            // Update network from info['bb']
-            if (updatedSystem.info['bb'] != null &&
-                updatedSystem.info['bb'] is num) {
-              _addSpot(
-                _netSpots,
-                now,
-                (updatedSystem.info['bb'] as num).toDouble() / 1024,
-              ); // KB/s
-            }
+      _systemUnsub = await PocketBaseService().pb
+          .collection('systems')
+          .subscribe(_system.id, (e) {
+            if (!mounted || e.record == null) return;
+            setState(() => _system = System.fromRecord(e.record!));
           });
-        }
-      });
+    } catch (e) {
+      debugPrint('System subscription failed: $e');
+    }
+  }
 
-      // Also subscribe to system_stats for detailed data
-      await pb.collection('system_stats').subscribe('*', (e) {
-        if (!mounted) return;
-        if (e.action == 'create' &&
-            e.record?.data['system'] == widget.system.id) {
-          final stats = e.record?.data['stats'];
-          if (stats != null) {
-            setState(() {
-              _latestStats = stats;
-              // Update per-core CPU usage
-              if (stats['cpus'] != null && stats['cpus'] is List) {
-                _cpuCoresUsage = (stats['cpus'] as List)
-                    .map((v) => (v is num) ? v.toInt() : 0)
-                    .toList();
-              }
-            });
+  Future<void> _loadDetails() async {
+    final d = await _api.fetchDetails(_system);
+    if (mounted) setState(() => _details = d);
+  }
+
+  Future<void> _loadContainers() async {
+    if (!versionAtLeast(_system.agentVersion, '0.14.0')) return;
+    try {
+      final c = await _api.fetchContainers(_system.id);
+      if (mounted) setState(() => _containers = c);
+    } catch (e) {
+      debugPrint('containers: $e');
+    }
+  }
+
+  Future<void> _loadServices() async {
+    try {
+      final s = await _api.fetchServices(_system.id);
+      if (mounted) setState(() => _services = s);
+    } catch (e) {
+      debugPrint('services: $e');
+    }
+  }
+
+  Future<void> _loadSmart() async {
+    try {
+      final s = await _api.fetchSmartDevices(_system.id);
+      if (mounted) setState(() => _smart = s);
+    } catch (e) {
+      debugPrint('smart: $e');
+    }
+  }
+
+  Future<void> _loadHistory() async {
+    if (_range == ChartRange.live) return;
+    final request = ++_historyRequest;
+    setState(() {
+      _historyLoading = true;
+      _error = null;
+    });
+    try {
+      final points = await _api.fetchStats(_system.id, _range);
+      if (!mounted || request != _historyRequest) return;
+      setState(() => _points = points);
+    } catch (e) {
+      if (mounted && request == _historyRequest) {
+        setState(() => _error = e.toString());
+      }
+    } finally {
+      if (mounted && request == _historyRequest) {
+        setState(() => _historyLoading = false);
+      }
+    }
+  }
+
+  /// Starts live streaming or periodic history refresh for the current range.
+  void _applyRange() {
+    _refreshTimer?.cancel();
+    _liveUnsub?.call().catchError((_) {});
+    _liveUnsub = null;
+
+    if (_range == ChartRange.live) {
+      _startLive();
+      return;
+    }
+    final every = _range.expectedInterval < const Duration(minutes: 2)
+        ? const Duration(minutes: 1)
+        : const Duration(minutes: 5);
+    _refreshTimer = Timer.periodic(every, (_) {
+      _loadHistory();
+      _loadContainers();
+      _loadServices();
+    });
+  }
+
+  Future<void> _startLive() async {
+    setState(() {
+      _points = [];
+      _historyLoading = true;
+    });
+    try {
+      _liveUnsub = await _api.subscribeLive(_system.id, (data) {
+        if (!mounted || _range != ChartRange.live) return;
+        setState(() {
+          _historyLoading = false;
+          final stats = asMap(data['stats']);
+          if (stats.isNotEmpty) {
+            _points = [..._points, StatsPoint(DateTime.now(), stats)];
+            if (_points.length > 60) {
+              _points = _points.sublist(_points.length - 60);
+            }
           }
-        }
+          final info = asMap(data['info']);
+          if (info.isNotEmpty) {
+            _system = System(
+              id: _system.id,
+              name: _system.name,
+              host: _system.host,
+              port: _system.port,
+              status: _system.status,
+              updated: _system.updated,
+              info: {..._system.info, ...info},
+            );
+          }
+        });
       });
     } catch (e) {
-      debugPrint('Subscription failed: $e');
-    }
-  }
-
-  Future<void> _unsubscribeFromRealtime() async {
-    try {
-      final pb = PocketBaseService().pb;
-      await pb.collection('systems').unsubscribe(widget.system.id);
-      await pb.collection('system_stats').unsubscribe('*');
-    } catch (_) {}
-  }
-
-  void _addSpot(List<FlSpot> spots, double x, double y) {
-    spots.add(FlSpot(x, y));
-    if (spots.length > 60) {
-      spots.removeAt(0);
-    }
-  }
-
-  Future<void> _fetchHistory() async {
-    try {
-      final pb = PocketBaseService().pb;
-      final records = await pb
-          .collection('system_stats')
-          .getList(
-            page: 1,
-            perPage: 60,
-            filter: 'system = "${widget.system.id}"',
-            sort: '-created',
-          );
-
-      final reversed = records.items.reversed.toList();
-
-      List<FlSpot> cpu = [];
-      List<FlSpot> ram = [];
-      List<FlSpot> disk = [];
-      List<FlSpot> net = [];
-
-      for (var r in reversed) {
-        final DateTime time = DateTime.parse(r.created).toLocal();
-        final double xVal = time.millisecondsSinceEpoch.toDouble();
-
-        double getDouble(dynamic val) {
-          if (val is int) return val.toDouble();
-          if (val is double) return val;
-          if (val is String) return double.tryParse(val) ?? 0.0;
-          return 0.0;
-        }
-
-        double extract(String key) {
-          if (r.data['stats'] is Map) {
-            final s = r.data['stats'];
-            if (s.containsKey(key)) return getDouble(s[key]);
-          }
-          return 0.0;
-        }
-
-        cpu.add(FlSpot(xVal, extract('cpu')));
-        ram.add(FlSpot(xVal, extract('mp')));
-        disk.add(FlSpot(xVal, extract('dp')));
-
-        // Network: ns + nr (bytes/s to KB/s)
-        double netVal = (extract('ns') + extract('nr')) / 1024;
-        net.add(FlSpot(xVal, netVal));
-      }
-
-      // Get latest stats for detailed view
-      if (records.items.isNotEmpty) {
-        final latest = records.items.first.data['stats'];
-        if (latest != null) {
-          _latestStats = latest;
-          if (latest['cpus'] != null && latest['cpus'] is List) {
-            _cpuCoresUsage = (latest['cpus'] as List)
-                .map((v) => (v is num) ? v.toInt() : 0)
-                .toList();
-          }
-        }
-      }
-
       if (mounted) {
         setState(() {
-          _cpuSpots = cpu;
-          _ramSpots = ram;
-          _diskSpots = disk;
-          _netSpots = net;
-          _isLoading = false;
+          _historyLoading = false;
+          _error = e.toString();
         });
       }
-    } catch (e) {
-      if (mounted) {
-        setState(() => _isLoading = false);
-      }
-      debugPrint("Error fetching history: $e");
     }
   }
+
+  Future<void> _setRange(ChartRange range) async {
+    if (range == _range) return;
+    setState(() {
+      _range = range;
+      _points = [];
+    });
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_rangePrefKey, range.label);
+    await _loadHistory();
+    _applyRange();
+  }
+
+  Future<void> _refreshAll() async {
+    await Future.wait([
+      _loadHistory(),
+      _loadContainers(),
+      _loadServices(),
+      _loadSmart(),
+    ]);
+  }
+
+  StatsPoint? get _latest => _points.isEmpty ? null : _points.last;
+
+  List<_Tab> get _tabs {
+    final latest = _latest;
+    final hasSensors =
+        _system.temperature != null ||
+        _system.battery != null ||
+        (latest != null &&
+            (latest.temperatures.isNotEmpty ||
+                latest.fans.isNotEmpty ||
+                latest.batteries.isNotEmpty));
+    final hasGpu =
+        _system.gpuPercent != null ||
+        (latest != null && latest.gpus.isNotEmpty);
+    return [
+      _Tab.overview,
+      _Tab.cpu,
+      _Tab.memory,
+      _Tab.disk,
+      _Tab.network,
+      if (hasSensors) _Tab.sensors,
+      if (hasGpu) _Tab.gpu,
+      if (_containers.isNotEmpty) _Tab.containers,
+      if (_services.isNotEmpty) _Tab.services,
+      if (_smart.isNotEmpty) _Tab.smart,
+    ];
+  }
+
+  // ---------------------------------------------------------------- build
 
   @override
   Widget build(BuildContext context) {
-    final isLandscape =
-        MediaQuery.of(context).orientation == Orientation.landscape;
-
-    return Scaffold(
-      appBar: AppBar(title: Text(widget.system.name), elevation: 0),
-      body: isLandscape ? _buildLandscapeLayout() : _buildPortraitLayout(),
-    );
-  }
-
-  Widget _buildLandscapeLayout() {
-    return Row(
-      children: [
-        // Sidebar
-        SizedBox(width: 140, child: _buildSidebar()),
-        const VerticalDivider(width: 1),
-        // Main content
-        Expanded(child: _buildMainPanel()),
-      ],
-    );
-  }
-
-  Widget _buildPortraitLayout() {
-    return Column(
-      children: [
-        // Horizontal category tabs
-        SizedBox(height: 80, child: _buildHorizontalTabs()),
-        const Divider(height: 1),
-        // Main content
-        Expanded(child: _buildMainPanel()),
-      ],
-    );
-  }
-
-  Widget _buildSidebar() {
-    return Container(
-      color: Theme.of(
-        context,
-      ).colorScheme.surfaceContainerHighest.withOpacity(0.3),
-      child: ListView(
-        padding: const EdgeInsets.symmetric(vertical: 8),
-        children: [
-          _buildSidebarItem(0, Icons.memory, 'CPU', widget.system.cpuPercent),
-          _buildSidebarItem(
-            1,
-            Icons.storage,
-            tr('ram'),
-            widget.system.memoryPercent,
-          ),
-          _buildSidebarItem(
-            2,
-            Icons.disc_full,
-            tr('disk'),
-            widget.system.diskPercent,
-          ),
-          _buildSidebarItem(3, Icons.network_check, tr('network'), null),
-        ],
+    if (_initialLoading) {
+      return Scaffold(
+        appBar: AppBar(title: Text(_system.name)),
+        body: const Center(child: CircularProgressIndicator()),
+      );
+    }
+    final tabs = _tabs;
+    return DefaultTabController(
+      key: ValueKey(tabs.map((t) => t.name).join(',')),
+      length: tabs.length,
+      child: Builder(
+        builder: (context) {
+          final controller = DefaultTabController.of(context);
+          return Scaffold(
+            appBar: AppBar(
+              titleSpacing: 0,
+              title: Row(
+                children: [
+                  osIcon(_details?.os ?? _system.os),
+                  const SizedBox(width: 8),
+                  Flexible(
+                    child: Text(_system.name, overflow: TextOverflow.ellipsis),
+                  ),
+                  const SizedBox(width: 8),
+                  StatusBadge(status: _system.status),
+                ],
+              ),
+              bottom: PreferredSize(
+                preferredSize: const Size.fromHeight(48 + 44),
+                child: Column(
+                  children: [
+                    TabBar(
+                      isScrollable: true,
+                      tabAlignment: TabAlignment.start,
+                      tabs: [
+                        for (final t in tabs)
+                          Tab(
+                            height: 44,
+                            icon: null,
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(t.icon, size: 16),
+                                const SizedBox(width: 6),
+                                Text('tab_${t.name}'.tr()),
+                              ],
+                            ),
+                          ),
+                      ],
+                    ),
+                    AnimatedBuilder(
+                      animation: controller,
+                      builder: (context, _) => tabs[controller.index].hasCharts
+                          ? _buildRangeSelector()
+                          : const SizedBox(height: 44),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            body: TabBarView(
+              children: [for (final t in tabs) _buildTab(t)],
+            ),
+          );
+        },
       ),
     );
   }
 
-  Widget _buildSidebarItem(
-    int index,
-    IconData icon,
-    String label,
-    double? value,
-  ) {
-    final isSelected = _selectedCategory == index;
-    final color = isSelected
-        ? Theme.of(context).colorScheme.primary
-        : Theme.of(context).colorScheme.onSurface.withOpacity(0.7);
-
-    return InkWell(
-      onTap: () => setState(() => _selectedCategory = index),
-      child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 12),
-        decoration: BoxDecoration(
-          color: isSelected
-              ? Theme.of(context).colorScheme.primaryContainer.withOpacity(0.5)
-              : null,
-          border: isSelected
-              ? Border(
-                  left: BorderSide(
-                    color: Theme.of(context).colorScheme.primary,
-                    width: 3,
-                  ),
-                )
-              : null,
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
+  Widget _buildRangeSelector() {
+    final ranges = [
+      if (_liveSupported) ChartRange.live,
+      ChartRange.hour,
+      ChartRange.halfDay,
+      ChartRange.day,
+      ChartRange.week,
+      ChartRange.month,
+    ];
+    return SizedBox(
+      height: 44,
+      child: Row(
+        children: [
+          Expanded(
+            child: ListView(
+              scrollDirection: Axis.horizontal,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
               children: [
-                Icon(icon, size: 18, color: color),
-                const SizedBox(width: 8),
-                Text(
-                  label,
-                  style: TextStyle(fontWeight: FontWeight.w600, color: color),
-                ),
+                for (final r in ranges)
+                  Padding(
+                    padding: const EdgeInsets.only(right: 6),
+                    child: ChoiceChip(
+                      showCheckmark: false,
+                      visualDensity: VisualDensity.compact,
+                      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      avatar: r == ChartRange.live
+                          ? const Icon(Icons.bolt, size: 16)
+                          : null,
+                      label: Text('range_${r.label}'.tr()),
+                      selected: _range == r,
+                      onSelected: (_) => _setRange(r),
+                    ),
+                  ),
               ],
             ),
-            if (value != null) ...[
-              const SizedBox(height: 4),
-              Text(
-                '${value.toStringAsFixed(1)}%',
-                style: TextStyle(fontSize: 12, color: color.withOpacity(0.8)),
+          ),
+          if (_historyLoading)
+            const Padding(
+              padding: EdgeInsets.only(right: 16),
+              child: SizedBox(
+                width: 16,
+                height: 16,
+                child: CircularProgressIndicator(strokeWidth: 2),
               ),
-              const SizedBox(height: 4),
-              LinearProgressIndicator(
-                value: value / 100,
-                backgroundColor: Colors.grey.withOpacity(0.3),
-                valueColor: AlwaysStoppedAnimation(_getUsageColor(value)),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTab(_Tab tab) {
+    final List<Widget> children;
+    switch (tab) {
+      case _Tab.overview:
+        children = _overview();
+      case _Tab.cpu:
+        children = _cpu();
+      case _Tab.memory:
+        children = _memory();
+      case _Tab.disk:
+        children = _disk();
+      case _Tab.network:
+        children = _network();
+      case _Tab.sensors:
+        children = _sensors();
+      case _Tab.gpu:
+        children = _gpu();
+      case _Tab.containers:
+        children = _containersTab();
+      case _Tab.services:
+        children = _servicesTab();
+      case _Tab.smart:
+        children = _smartTab();
+    }
+    return RefreshIndicator(
+      onRefresh: _refreshAll,
+      child: ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: const EdgeInsets.fromLTRB(12, 12, 12, 32),
+        children: [
+          if (_error != null && tab.hasCharts)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: Text(_error!, style: const TextStyle(color: Colors.red)),
+            ),
+          ...children,
+        ],
+      ),
+    );
+  }
+
+  // ------------------------------------------------------------- helpers
+
+  ChartSeries _series(
+    String label,
+    Color color,
+    double? Function(StatsPoint p) value, {
+    bool fill = true,
+    bool dashed = false,
+  }) {
+    return ChartSeries(
+      label: label,
+      color: color,
+      fill: fill,
+      dashed: dashed,
+      points: [for (final p in _points) (p.time, value(p))],
+    );
+  }
+
+  bool get _showMax => _range != ChartRange.live && _range != ChartRange.hour;
+
+  String _pct(double v) => '${v.toStringAsFixed(v < 10 ? 1 : 0)}%';
+
+  Widget _chartCard(
+    String title,
+    List<ChartSeries> series, {
+    required String Function(double) format,
+    double? maxY,
+    IconData? icon,
+    String? subtitle,
+  }) {
+    return SectionCard(
+      title: title,
+      subtitle: subtitle,
+      icon: icon,
+      child: TimeSeriesChart(
+        series: series,
+        range: _range,
+        formatValue: format,
+        maxY: maxY,
+      ),
+    );
+  }
+
+  // ------------------------------------------------------------ overview
+
+  List<Widget> _overview() {
+    final s = _system;
+    final d = _details;
+    final latest = _latest;
+    final la = s.loadAvg;
+    final threads = d?.threads ?? s.threads;
+
+    final info = <(String, String)>[
+      (tr('hostname'), d?.hostname ?? s.hostname ?? ''),
+      (tr('host'), s.port.isNotEmpty ? '${s.host}:${s.port}' : s.host),
+      (tr('os'), d?.osName.isNotEmpty == true ? d!.osName : _osName(d?.os ?? s.os)),
+      (tr('kernel'), d?.kernel ?? s.kernel ?? ''),
+      (tr('cpu_model'), d?.cpu ?? s.cpuModel ?? ''),
+      (
+        '${tr('cores')} / ${tr('threads')}',
+        '${d?.cores ?? s.cores} / $threads',
+      ),
+      if (d != null && d.arch.isNotEmpty) (tr('arch'), d.arch),
+      if (d != null && d.memory > 0) (tr('memory'), formatBytes(d.memory)),
+      (tr('uptime'), formatUptime(s.uptime)),
+      (tr('agent_version'), s.agentVersion ?? '-'),
+      if (s.connectionType > 0)
+        (tr('connection'), s.connectionType == 2 ? 'WebSocket' : 'SSH'),
+      if (d?.podman == true) ('Podman', '✓'),
+    ];
+
+    return [
+      if (s.isPaused || s.isPending || s.isDown)
+        Card(
+          color: statusColor(s.status).withValues(alpha: 0.12),
+          margin: const EdgeInsets.only(bottom: 12),
+          child: ListTile(
+            leading: Icon(Icons.info_outline, color: statusColor(s.status)),
+            title: Text('status_${s.status}_hint'.tr()),
+          ),
+        ),
+      SectionCard(
+        title: tr('usage'),
+        icon: Icons.speed,
+        child: Column(
+          children: [
+            UsageBar(label: 'CPU', percent: s.cpuPercent, icon: Icons.memory),
+            const SizedBox(height: 10),
+            UsageBar(
+              label: tr('ram'),
+              percent: s.memoryPercent,
+              icon: Icons.storage,
+              detail: latest != null && latest.memTotal > 0
+                  ? '${formatGB(latest.memUsed)} / ${formatGB(latest.memTotal)}'
+                  : null,
+            ),
+            const SizedBox(height: 10),
+            UsageBar(
+              label: s.rootDiskName ?? tr('disk'),
+              percent: s.diskPercent,
+              icon: Icons.disc_full,
+              detail: latest != null && latest.diskTotal > 0
+                  ? '${formatGB(latest.diskUsed)} / ${formatGB(latest.diskTotal)}'
+                  : null,
+            ),
+            for (final e in s.extraFs.entries) ...[
+              const SizedBox(height: 10),
+              UsageBar(label: e.key, percent: e.value, icon: Icons.disc_full),
+            ],
+            if (s.gpuPercent != null) ...[
+              const SizedBox(height: 10),
+              UsageBar(
+                label: 'GPU',
+                percent: s.gpuPercent!,
+                icon: Icons.videogame_asset_outlined,
               ),
             ],
           ],
         ),
       ),
-    );
-  }
-
-  Widget _buildHorizontalTabs() {
-    return ListView(
-      scrollDirection: Axis.horizontal,
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
-      children: [
-        _buildTabItem(0, Icons.memory, 'CPU', widget.system.cpuPercent),
-        _buildTabItem(1, Icons.storage, tr('ram'), widget.system.memoryPercent),
-        _buildTabItem(
-          2,
-          Icons.disc_full,
-          tr('disk'),
-          widget.system.diskPercent,
+      SectionCard(
+        title: tr('status'),
+        icon: Icons.monitor_heart_outlined,
+        child: KeyValueGrid(
+          items: [
+            (tr('network'), formatBytesRate(s.bandwidth)),
+            if (la.isNotEmpty)
+              (
+                tr('load'),
+                la.map((v) => v.toStringAsFixed(2)).join('  '),
+              ),
+            if (s.temperature != null) (tr('temperature'), formatTemp(s.temperature)),
+            if (s.battery != null)
+              (
+                tr('battery'),
+                '${s.battery!.$1}% · ${tr('battery_${s.battery!.$2.name}')}',
+              ),
+            if (s.services.isNotEmpty)
+              (
+                tr('services'),
+                '${s.services[0]} · ${tr('failed')}: ${s.services[1]}',
+              ),
+            for (final w in s.wifi.entries)
+              (
+                'Wi-Fi ${w.key}',
+                [
+                  if (w.value.$1 != null) w.value.$1!,
+                  if (w.value.$2 != null) '${w.value.$2!.toStringAsFixed(0)} dBm',
+                ].join(' · '),
+              ),
+          ],
         ),
-        _buildTabItem(3, Icons.network_check, tr('network'), null),
-      ],
-    );
-  }
-
-  Widget _buildTabItem(int index, IconData icon, String label, double? value) {
-    final isSelected = _selectedCategory == index;
-
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 4),
-      child: InkWell(
-        onTap: () => setState(() => _selectedCategory = index),
-        borderRadius: BorderRadius.circular(12),
-        child: Container(
-          width: 90,
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-          decoration: BoxDecoration(
-            color: isSelected
-                ? Theme.of(context).colorScheme.primaryContainer
-                : Theme.of(
-                    context,
-                  ).colorScheme.surfaceContainerHighest.withOpacity(0.5),
-            borderRadius: BorderRadius.circular(12),
-            border: isSelected
-                ? Border.all(
-                    color: Theme.of(context).colorScheme.primary,
-                    width: 2,
-                  )
+      ),
+      if (s.pendingUpdates.isNotEmpty && s.pendingUpdates[0] > 0)
+        Card(
+          margin: const EdgeInsets.only(bottom: 12),
+          child: ListTile(
+            leading: const Icon(Icons.system_update_alt, color: Colors.orange),
+            title: Text(
+              tr('pending_updates', args: ['${s.pendingUpdates[0]}']),
+            ),
+            subtitle: s.pendingUpdates.length > 1
+                ? Text(tr('security_updates', args: ['${s.pendingUpdates[1]}']))
                 : null,
+            trailing: const Icon(Icons.chevron_right),
+            onTap: _showPackageUpdates,
           ),
+        ),
+      SectionCard(
+        title: tr('system_info'),
+        icon: Icons.info_outline,
+        child: KeyValueGrid(items: info),
+      ),
+    ];
+  }
+
+  String _osName(SystemOs os) => switch (os) {
+    SystemOs.linux => 'Linux',
+    SystemOs.darwin => 'macOS',
+    SystemOs.windows => 'Windows',
+    SystemOs.freebsd => 'FreeBSD',
+    SystemOs.unknown => '-',
+  };
+
+  Future<void> _showPackageUpdates() async {
+    await showTextSheet(
+      context,
+      title: tr('pending_updates', args: ['${_system.pendingUpdates[0]}']),
+      load: () async {
+        final res = await _api.packageUpdates(_system.id);
+        final packages = res['packages'];
+        final buf = StringBuffer();
+        if (res['manager'] != null) buf.writeln('${res['manager']}\n');
+        if (packages is List) {
+          for (final p in packages) {
+            final m = asMap(p);
+            final sec = m['security'] == true ? ' [security]' : '';
+            buf.writeln(
+              '${m['name']}  ${m['current'] ?? ''} → ${m['available'] ?? ''}$sec',
+            );
+          }
+        }
+        return buf.toString();
+      },
+    );
+  }
+
+  // ----------------------------------------------------------------- cpu
+
+  List<Widget> _cpu() {
+    final latest = _latest;
+    final breakdown = latest?.cpuBreakdown ?? const [];
+    final cores = latest?.cpuCores ?? const [];
+    final hasLoad = _points.any((p) => p.loadAvg.length >= 3);
+    final threads = _details?.threads ?? _system.threads;
+
+    return [
+      _chartCard(
+        tr('cpu_usage'),
+        [
+          _series('CPU', Colors.blue, (p) => p.cpu),
+          if (_showMax && _points.any((p) => p.cpuMax != null))
+            _series(
+              tr('max'),
+              Colors.blue.shade200,
+              (p) => p.cpuMax,
+              fill: false,
+              dashed: true,
+            ),
+        ],
+        format: _pct,
+        maxY: 100,
+        icon: Icons.memory,
+        subtitle: _details?.cpu ?? _system.cpuModel,
+      ),
+      if (breakdown.length >= 5)
+        SectionCard(
+          title: tr('cpu_breakdown'),
+          icon: Icons.donut_small,
           child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(icon, size: 18),
-              const SizedBox(height: 2),
-              Text(
-                label,
-                style: const TextStyle(
-                  fontSize: 11,
-                  fontWeight: FontWeight.w600,
-                ),
-                overflow: TextOverflow.ellipsis,
-              ),
-              if (value != null)
-                Text(
-                  '${value.toStringAsFixed(0)}%',
-                  style: TextStyle(
-                    fontSize: 10,
-                    color: Theme.of(
-                      context,
-                    ).colorScheme.onSurface.withOpacity(0.7),
-                  ),
-                ),
+              for (final (i, name) in const [
+                (0, 'user'),
+                (1, 'system'),
+                (2, 'iowait'),
+                (3, 'steal'),
+              ]) ...[
+                UsageBar(label: tr('cpu_$name'), percent: breakdown[i]),
+                const SizedBox(height: 8),
+              ],
             ],
           ),
         ),
-      ),
-    );
-  }
-
-  Widget _buildMainPanel() {
-    if (_isLoading) {
-      return const Center(child: CircularProgressIndicator());
-    }
-
-    switch (_selectedCategory) {
-      case 0:
-        return _buildCpuPanel();
-      case 1:
-        return _buildMemoryPanel();
-      case 2:
-        return _buildDiskPanel();
-      case 3:
-        return _buildNetworkPanel();
-      default:
-        return _buildCpuPanel();
-    }
-  }
-
-  Widget _buildCpuPanel() {
-    // Get CPU model from system info
-    String cpuModel = widget.system.info['m']?.toString() ?? 'Unknown';
-    int cores = widget.system.info['c'] is num
-        ? (widget.system.info['c'] as num).toInt()
-        : 0;
-    int threads = widget.system.info['t'] is num
-        ? (widget.system.info['t'] as num).toInt()
-        : 0;
-
-    // Uptime
-    int uptimeSeconds = widget.system.info['u'] is num
-        ? (widget.system.info['u'] as num).toInt()
-        : 0;
-    String uptime = _formatUptime(uptimeSeconds);
-
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(16),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // Header
-          Row(
-            children: [
-              Text(
-                'CPU',
-                style: Theme.of(context).textTheme.headlineMedium?.copyWith(
-                  color: Theme.of(context).colorScheme.primary,
-                  fontWeight: FontWeight.bold,
-                ),
+      if (hasLoad)
+        _chartCard(
+          tr('load_average'),
+          [
+            for (final (i, label, color) in [
+              (0, '1m', Colors.blue),
+              (1, '5m', Colors.orange),
+              (2, '15m', Colors.purple),
+            ])
+              _series(
+                label,
+                color,
+                (p) => p.loadAvg.length >= 3 ? p.loadAvg[i] : null,
+                fill: false,
               ),
-              const SizedBox(width: 16),
-              Expanded(
-                child: Text(
-                  cpuModel,
-                  style: Theme.of(context).textTheme.titleSmall,
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Text(
-            '60 ${tr('seconds')} ${tr('utilization')} %',
-            style: Theme.of(context).textTheme.bodySmall,
-          ),
-          const SizedBox(height: 16),
-
-          // Main chart
-          _buildMiniChart(_cpuSpots, Colors.blue, isPercent: true, height: 150),
-          const SizedBox(height: 24),
-
-          // Per-core CPU grid
-          if (_cpuCoresUsage.isNotEmpty) ...[
-            Text(
-              'CPU ${tr('cores')}',
-              style: Theme.of(context).textTheme.titleMedium,
-            ),
-            const SizedBox(height: 8),
-            _buildCpuCoreGrid(),
-            const SizedBox(height: 24),
           ],
-
-          // Stats grid
-          _buildStatsGrid([
-            _StatItem(
-              tr('utilization'),
-              '${widget.system.cpuPercent.toStringAsFixed(1)}%',
-            ),
-            _StatItem(tr('cores'), cores.toString()),
-            _StatItem(tr('threads'), threads.toString()),
-            _StatItem(tr('uptime'), uptime),
-          ]),
-        ],
-      ),
-    );
+          format: (v) => v.toStringAsFixed(2),
+          icon: Icons.speed,
+          subtitle: threads > 0 ? '${tr('threads')}: $threads' : null,
+        ),
+      if (cores.isNotEmpty)
+        SectionCard(
+          title: tr('cpu_cores'),
+          icon: Icons.grid_view,
+          child: _coreGrid(cores),
+        ),
+    ];
   }
 
-  Widget _buildMemoryPanel() {
-    double memTotal = _latestStats?['m'] is num
-        ? (_latestStats!['m'] as num).toDouble()
-        : 0;
-    double memUsed = _latestStats?['mu'] is num
-        ? (_latestStats!['mu'] as num).toDouble()
-        : 0;
-    double memBuffCache = _latestStats?['mb'] is num
-        ? (_latestStats!['mb'] as num).toDouble()
-        : 0;
-    double swapTotal = _latestStats?['s'] is num
-        ? (_latestStats!['s'] as num).toDouble()
-        : 0;
-    double swapUsed = _latestStats?['su'] is num
-        ? (_latestStats!['su'] as num).toDouble()
-        : 0;
-
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(16),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            tr('ram'),
-            style: Theme.of(context).textTheme.headlineMedium?.copyWith(
-              color: Theme.of(context).colorScheme.primary,
-              fontWeight: FontWeight.bold,
-            ),
+  Widget _coreGrid(List<double> cores) {
+    return LayoutBuilder(
+      builder: (context, c) {
+        final cols = math.max(2, (c.maxWidth / 86).floor());
+        return GridView.builder(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: cols,
+            childAspectRatio: 2.1,
+            crossAxisSpacing: 6,
+            mainAxisSpacing: 6,
           ),
-          const SizedBox(height: 8),
-          Text(
-            '${memUsed.toStringAsFixed(2)} / ${memTotal.toStringAsFixed(2)} GB',
-            style: Theme.of(context).textTheme.titleMedium,
-          ),
-          const SizedBox(height: 16),
-
-          _buildMiniChart(
-            _ramSpots,
-            Colors.purple,
-            isPercent: true,
-            height: 150,
-          ),
-          const SizedBox(height: 24),
-
-          _buildStatsGrid([
-            _StatItem(tr('total'), '${memTotal.toStringAsFixed(2)} GB'),
-            _StatItem(tr('used'), '${memUsed.toStringAsFixed(2)} GB'),
-            _StatItem('Buffer/Cache', '${memBuffCache.toStringAsFixed(2)} GB'),
-            _StatItem(
-              tr('utilization'),
-              '${widget.system.memoryPercent.toStringAsFixed(1)}%',
-            ),
-            if (swapTotal > 0) ...[
-              _StatItem(
-                'Swap',
-                '${swapUsed.toStringAsFixed(2)} / ${swapTotal.toStringAsFixed(2)} GB',
+          itemCount: cores.length,
+          itemBuilder: (context, index) {
+            final usage = cores[index];
+            final color = usageColor(usage);
+            return Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                borderRadius: BorderRadius.circular(8),
               ),
-            ],
-          ]),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildDiskPanel() {
-    double diskTotal = _latestStats?['d'] is num
-        ? (_latestStats!['d'] as num).toDouble()
-        : 0;
-    double diskUsed = _latestStats?['du'] is num
-        ? (_latestStats!['du'] as num).toDouble()
-        : 0;
-    double diskRead = _latestStats?['dr'] is num
-        ? (_latestStats!['dr'] as num).toDouble()
-        : 0;
-    double diskWrite = _latestStats?['dw'] is num
-        ? (_latestStats!['dw'] as num).toDouble()
-        : 0;
-
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(16),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            tr('disk'),
-            style: Theme.of(context).textTheme.headlineMedium?.copyWith(
-              color: Theme.of(context).colorScheme.primary,
-              fontWeight: FontWeight.bold,
-            ),
-          ),
-          const SizedBox(height: 8),
-          Text(
-            '${diskUsed.toStringAsFixed(2)} / ${diskTotal.toStringAsFixed(2)} GB',
-            style: Theme.of(context).textTheme.titleMedium,
-          ),
-          const SizedBox(height: 16),
-
-          _buildMiniChart(
-            _diskSpots,
-            Colors.orange,
-            isPercent: true,
-            height: 150,
-          ),
-          const SizedBox(height: 24),
-
-          _buildStatsGrid([
-            _StatItem(tr('total'), '${diskTotal.toStringAsFixed(2)} GB'),
-            _StatItem(tr('used'), '${diskUsed.toStringAsFixed(2)} GB'),
-            _StatItem(
-              tr('utilization'),
-              '${widget.system.diskPercent.toStringAsFixed(1)}%',
-            ),
-            _StatItem('Read', '${diskRead.toStringAsFixed(2)} MB/s'),
-            _StatItem('Write', '${diskWrite.toStringAsFixed(2)} MB/s'),
-          ]),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildNetworkPanel() {
-    // Network interfaces - contains [upDelta, downDelta, totalSent, totalRecv]
-    Map<String, dynamic>? ni = _latestStats?['ni'];
-
-    // Calculate total network speed from all interfaces
-    double totalSent = 0;
-    double totalRecv = 0;
-    if (ni != null) {
-      ni.forEach((key, value) {
-        if (value is List && value.length >= 2) {
-          totalSent += (value[0] is num) ? (value[0] as num).toDouble() : 0;
-          totalRecv += (value[1] is num) ? (value[1] as num).toDouble() : 0;
-        }
-      });
-    }
-
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(16),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            tr('network'),
-            style: Theme.of(context).textTheme.headlineMedium?.copyWith(
-              color: Theme.of(context).colorScheme.primary,
-              fontWeight: FontWeight.bold,
-            ),
-          ),
-          const SizedBox(height: 8),
-          Text(
-            '↑ ${_formatBytesSpeed(totalSent)}  ↓ ${_formatBytesSpeed(totalRecv)}',
-            style: Theme.of(context).textTheme.titleMedium,
-          ),
-          const SizedBox(height: 16),
-
-          _buildMiniChart(
-            _netSpots,
-            Colors.green,
-            isPercent: false,
-            height: 150,
-          ),
-          const SizedBox(height: 24),
-
-          _buildStatsGrid([
-            _StatItem('Upload', _formatBytesSpeed(totalSent)),
-            _StatItem('Download', _formatBytesSpeed(totalRecv)),
-          ]),
-
-          // Network interfaces
-          if (ni != null && ni.isNotEmpty) ...[
-            const SizedBox(height: 24),
-            Text('Interfaces', style: Theme.of(context).textTheme.titleMedium),
-            const SizedBox(height: 8),
-            ...ni.entries.map((e) {
-              final data = e.value;
-              if (data is List && data.length >= 4) {
-                return Card(
-                  child: ListTile(
-                    title: Text(e.key),
-                    subtitle: Text(
-                      '↑ ${_formatBytes(data[2].toDouble())} / ↓ ${_formatBytes(data[3].toDouble())}',
-                    ),
-                    trailing: Text(
-                      '${_formatBytesSpeed(data[0].toDouble())} / ${_formatBytesSpeed(data[1].toDouble())}',
-                    ),
-                  ),
-                );
-              }
-              return const SizedBox();
-            }),
-          ],
-        ],
-      ),
-    );
-  }
-
-  Widget _buildCpuCoreGrid() {
-    // Calculate number of columns based on core count
-    int crossAxisCount = 4;
-    if (_cpuCoresUsage.length <= 2)
-      crossAxisCount = 2;
-    else if (_cpuCoresUsage.length <= 8)
-      crossAxisCount = 4;
-    else
-      crossAxisCount = 4;
-
-    return GridView.builder(
-      shrinkWrap: true,
-      physics: const NeverScrollableScrollPhysics(),
-      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: crossAxisCount,
-        childAspectRatio: 1.8,
-        crossAxisSpacing: 6,
-        mainAxisSpacing: 6,
-      ),
-      itemCount: _cpuCoresUsage.length,
-      itemBuilder: (context, index) {
-        final usage = _cpuCoresUsage[index];
-        final color = _getUsageColor(usage.toDouble());
-
-        return Container(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-          decoration: BoxDecoration(
-            color: Theme.of(context).colorScheme.surfaceContainerHighest,
-            borderRadius: BorderRadius.circular(8),
-            border: Border.all(color: color.withOpacity(0.3), width: 1),
-          ),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
+              child: Column(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    'CPU $index',
-                    style: const TextStyle(
-                      fontSize: 10,
-                      fontWeight: FontWeight.w500,
-                    ),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text('$index', style: const TextStyle(fontSize: 10)),
+                      Text(
+                        '${usage.toStringAsFixed(0)}%',
+                        style: TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold,
+                          color: color,
+                        ),
+                      ),
+                    ],
                   ),
-                  Text(
-                    '$usage%',
-                    style: TextStyle(
-                      fontSize: 10,
-                      fontWeight: FontWeight.bold,
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(2),
+                    child: LinearProgressIndicator(
+                      value: (usage / 100).clamp(0.0, 1.0),
+                      minHeight: 5,
                       color: color,
+                      backgroundColor: Colors.grey.withValues(alpha: 0.2),
                     ),
                   ),
                 ],
               ),
-              ClipRRect(
-                borderRadius: BorderRadius.circular(2),
-                child: LinearProgressIndicator(
-                  value: usage / 100,
-                  minHeight: 6,
-                  backgroundColor: Colors.grey.withOpacity(0.2),
-                  valueColor: AlwaysStoppedAnimation(color),
-                ),
-              ),
-            ],
-          ),
+            );
+          },
         );
       },
     );
   }
 
-  Widget _buildMiniChart(
-    List<FlSpot> spots,
-    Color color, {
-    required bool isPercent,
-    double height = 120,
-  }) {
-    double? maxY = isPercent ? 100 : null;
-    if (!isPercent && spots.isNotEmpty) {
-      maxY = spots.map((s) => s.y).reduce((a, b) => a > b ? a : b) * 1.2;
-      if (maxY < 1) maxY = 1;
-    }
+  // -------------------------------------------------------------- memory
 
-    return SizedBox(
-      height: height,
-      child: spots.isEmpty
-          ? Center(child: Text(tr('no_history')))
-          : LineChart(
-              LineChartData(
-                gridData: FlGridData(show: true, drawVerticalLine: false),
-                titlesData: FlTitlesData(
-                  leftTitles: AxisTitles(
-                    sideTitles: SideTitles(
-                      showTitles: true,
-                      reservedSize: 35,
-                      getTitlesWidget: (value, meta) => Text(
-                        value.toInt().toString(),
-                        style: const TextStyle(fontSize: 10),
-                      ),
-                    ),
-                  ),
-                  bottomTitles: const AxisTitles(
-                    sideTitles: SideTitles(showTitles: false),
-                  ),
-                  rightTitles: const AxisTitles(
-                    sideTitles: SideTitles(showTitles: false),
-                  ),
-                  topTitles: const AxisTitles(
-                    sideTitles: SideTitles(showTitles: false),
-                  ),
+  List<Widget> _memory() {
+    final latest = _latest;
+    final total = latest?.memTotal ?? 0;
+    final hasSwap = _points.any((p) => p.swapTotal > 0);
+    final hasArc = _points.any((p) => p.memZfsArc > 0);
+    return [
+      _chartCard(
+        tr('memory_usage'),
+        [
+          _series(tr('used'), Colors.purple, (p) => p.memUsed),
+          _series(
+            tr('buff_cache'),
+            Colors.teal,
+            (p) => p.memBuffCache > 0 ? p.memBuffCache : null,
+            fill: false,
+          ),
+          if (hasArc)
+            _series('ZFS ARC', Colors.amber, (p) => p.memZfsArc, fill: false),
+        ],
+        format: formatGB,
+        maxY: total > 0 ? total : null,
+        icon: Icons.storage,
+      ),
+      if (latest != null)
+        SectionCard(
+          title: tr('ram'),
+          icon: Icons.info_outline,
+          child: KeyValueGrid(
+            items: [
+              (tr('total'), formatGB(latest.memTotal)),
+              (tr('used'), formatGB(latest.memUsed)),
+              (tr('buff_cache'), formatGB(latest.memBuffCache)),
+              (tr('utilization'), formatPercent(latest.memPercent)),
+              if (latest.memZfsArc > 0) ('ZFS ARC', formatGB(latest.memZfsArc)),
+              if (latest.swapTotal > 0)
+                (
+                  'Swap',
+                  '${formatGB(latest.swapUsed)} / ${formatGB(latest.swapTotal)}',
                 ),
-                borderData: FlBorderData(show: true),
-                lineBarsData: [
-                  LineChartBarData(
-                    spots: spots,
-                    isCurved: true,
-                    color: color,
-                    barWidth: 2,
-                    dotData: const FlDotData(show: false),
-                    belowBarData: BarAreaData(
-                      show: true,
-                      color: color.withOpacity(0.2),
-                    ),
-                  ),
-                ],
-                minY: 0,
-                maxY: maxY,
-              ),
-            ),
-    );
+            ],
+          ),
+        ),
+      if (hasSwap)
+        _chartCard(
+          tr('swap_usage'),
+          [_series('Swap', Colors.deepOrange, (p) => p.swapUsed)],
+          format: formatGB,
+          maxY: latest != null && latest.swapTotal > 0 ? latest.swapTotal : null,
+          icon: Icons.swap_horiz,
+        ),
+    ];
   }
 
-  Widget _buildStatsGrid(List<_StatItem> items) {
-    return Wrap(
-      spacing: 24,
-      runSpacing: 12,
-      children: items
-          .map(
-            (item) => SizedBox(
-              width: 150,
+  // ---------------------------------------------------------------- disk
+
+  List<Widget> _disk() {
+    final latest = _latest;
+    final fsNames = <String>{
+      for (final p in _points) ...p.extraFs.keys,
+    }.toList()..sort();
+    final pools = latest?.pools ?? const <String, StoragePool>{};
+    final totals = latest?.diskIoTotal ?? const [];
+
+    return [
+      _chartCard(
+        _system.rootDiskName ?? tr('root_disk'),
+        [_series(tr('used'), Colors.orange, (p) => p.diskUsed)],
+        format: formatGB,
+        maxY: latest != null && latest.diskTotal > 0 ? latest.diskTotal : null,
+        icon: Icons.disc_full,
+        subtitle: latest != null
+            ? '${formatGB(latest.diskUsed)} / ${formatGB(latest.diskTotal)} · ${formatPercent(latest.diskPercent)}'
+            : null,
+      ),
+      _chartCard(
+        tr('disk_io'),
+        [
+          _series(tr('read'), Colors.blue, (p) => p.diskIo[0]),
+          _series(tr('write'), Colors.red, (p) => p.diskIo[1]),
+        ],
+        format: formatBytesRate,
+        icon: Icons.sync_alt,
+        subtitle: totals.length >= 2
+            ? '${tr('total')}: ↓ ${formatBytes(totals[0])} · ↑ ${formatBytes(totals[1])}'
+            : null,
+      ),
+      for (final name in fsNames) ..._extraFsCards(name),
+      if (pools.isNotEmpty)
+        SectionCard(
+          title: tr('storage_pools'),
+          icon: Icons.layers_outlined,
+          child: Column(
+            children: [
+              for (final e in pools.entries)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 10),
+                  child: UsageBar(
+                    label:
+                        '${e.value.name ?? e.key}${e.value.health != null ? ' · ${e.value.health}' : ''}',
+                    percent: e.value.percent,
+                    detail:
+                        '${formatGB(e.value.used)} / ${formatGB(e.value.total)}',
+                  ),
+                ),
+            ],
+          ),
+        ),
+    ];
+  }
+
+  List<Widget> _extraFsCards(String name) {
+    ExtraFs? last;
+    for (final p in _points.reversed) {
+      last = p.extraFs[name];
+      if (last != null) break;
+    }
+    return [
+      _chartCard(
+        name,
+        [_series(tr('used'), Colors.orange, (p) => p.extraFs[name]?.used)],
+        format: formatGB,
+        maxY: last != null && last.total > 0 ? last.total : null,
+        icon: Icons.disc_full,
+        subtitle: last != null
+            ? '${formatGB(last.used)} / ${formatGB(last.total)} · ${formatPercent(last.percent)}'
+            : null,
+      ),
+      _chartCard(
+        '$name · ${tr('disk_io')}',
+        [
+          _series(tr('read'), Colors.blue, (p) => p.extraFs[name]?.readRate),
+          _series(tr('write'), Colors.red, (p) => p.extraFs[name]?.writeRate),
+        ],
+        format: formatBytesRate,
+        icon: Icons.sync_alt,
+        subtitle: last?.totalRead != null
+            ? '${tr('total')}: ↓ ${formatBytes(last!.totalRead)} · ↑ ${formatBytes(last.totalWrite)}'
+            : null,
+      ),
+    ];
+  }
+
+  // ------------------------------------------------------------- network
+
+  List<Widget> _network() {
+    final latest = _latest;
+    final ni = latest?.interfaces ?? const <String, List<double>>{};
+    double totalUp = 0, totalDown = 0;
+    for (final v in ni.values) {
+      if (v.length >= 4) {
+        totalUp += v[2];
+        totalDown += v[3];
+      }
+    }
+    return [
+      _chartCard(
+        tr('bandwidth'),
+        [
+          _series(tr('sent'), Colors.green, (p) => p.network[0]),
+          _series(tr('received'), Colors.blue, (p) => p.network[1]),
+        ],
+        format: formatBytesRate,
+        icon: Icons.swap_vert,
+        subtitle: latest != null
+            ? '↑ ${formatBytesRate(latest.network[0])}  ↓ ${formatBytesRate(latest.network[1])}'
+            : null,
+      ),
+      if (ni.isNotEmpty)
+        SectionCard(
+          title: tr('interfaces'),
+          icon: Icons.lan_outlined,
+          subtitle:
+              '${tr('total')}: ↑ ${formatBytes(totalUp)} · ↓ ${formatBytes(totalDown)}',
+          child: Column(
+            children: [
+              for (final e in ni.entries)
+                ListTile(
+                  dense: true,
+                  contentPadding: EdgeInsets.zero,
+                  leading: const Icon(Icons.settings_ethernet),
+                  title: Text(e.key),
+                  subtitle: e.value.length >= 4
+                      ? Text(
+                          '${tr('total')}: ↑ ${formatBytes(e.value[2])} · ↓ ${formatBytes(e.value[3])}',
+                        )
+                      : null,
+                  trailing: e.value.length >= 2
+                      ? Text(
+                          '↑ ${formatBytesRate(e.value[0])}\n↓ ${formatBytesRate(e.value[1])}',
+                          textAlign: TextAlign.right,
+                          style: const TextStyle(fontSize: 12),
+                        )
+                      : null,
+                ),
+            ],
+          ),
+        ),
+    ];
+  }
+
+  // ------------------------------------------------------------- sensors
+
+  List<Widget> _sensors() {
+    final latest = _latest;
+    final temps = latest?.temperatures ?? const <String, double>{};
+    final sorted = temps.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+    final chartSensors = sorted.take(8).map((e) => e.key).toList();
+    final fans = latest?.fans ?? const <String, double>{};
+    final batteries = latest?.batteries ?? const <String, double>{};
+    final battery = _system.battery;
+
+    return [
+      if (chartSensors.isNotEmpty)
+        _chartCard(
+          tr('temperature'),
+          [
+            for (var i = 0; i < chartSensors.length; i++)
+              _series(
+                chartSensors[i],
+                chartPalette[i % chartPalette.length],
+                (p) => p.temperatures[chartSensors[i]],
+                fill: false,
+              ),
+          ],
+          format: (v) => '${v.toStringAsFixed(0)}°',
+          icon: Icons.thermostat,
+        ),
+      if (sorted.isNotEmpty)
+        SectionCard(
+          title: tr('sensors'),
+          icon: Icons.sensors,
+          child: Column(
+            children: [
+              for (final e in sorted)
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 3),
+                  child: Row(
+                    children: [
+                      Expanded(child: Text(e.key, style: const TextStyle(fontSize: 13))),
+                      Text(
+                        formatTemp(e.value),
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          color: tempColor(e.value),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+            ],
+          ),
+        ),
+      if (fans.isNotEmpty)
+        SectionCard(
+          title: tr('fans'),
+          icon: Icons.wind_power,
+          child: KeyValueGrid(
+            items: [
+              for (final e in fans.entries)
+                (e.key, '${e.value.toStringAsFixed(0)} RPM'),
+            ],
+          ),
+        ),
+      if (battery != null || batteries.isNotEmpty)
+        SectionCard(
+          title: tr('battery'),
+          icon: Icons.battery_std,
+          child: Column(
+            children: [
+              if (battery != null)
+                UsageBar(
+                  label: tr('battery_${battery.$2.name}'),
+                  percent: battery.$1.toDouble(),
+                ),
+              for (final e in batteries.entries) ...[
+                const SizedBox(height: 8),
+                UsageBar(label: e.key, percent: e.value),
+              ],
+            ],
+          ),
+        ),
+    ];
+  }
+
+  // ----------------------------------------------------------------- gpu
+
+  List<Widget> _gpu() {
+    final ids = <String>{for (final p in _points) ...p.gpus.keys}.toList()
+      ..sort();
+    if (ids.isEmpty) {
+      return [
+        SectionCard(
+          title: 'GPU',
+          icon: Icons.videogame_asset_outlined,
+          child: UsageBar(label: 'GPU', percent: _system.gpuPercent ?? 0),
+        ),
+      ];
+    }
+    final widgets = <Widget>[];
+    for (final id in ids) {
+      Gpu? last;
+      for (final p in _points.reversed) {
+        last = p.gpus[id];
+        if (last != null) break;
+      }
+      final name = last?.name ?? id;
+      widgets.add(
+        _chartCard(
+          name,
+          [_series(tr('utilization'), Colors.green, (p) => p.gpus[id]?.usage)],
+          format: _pct,
+          maxY: 100,
+          icon: Icons.videogame_asset_outlined,
+          subtitle: last != null ? formatPercent(last.usage) : null,
+        ),
+      );
+      if (_points.any((p) => p.gpus[id]?.memUsed != null)) {
+        widgets.add(
+          _chartCard(
+            '$name · ${tr('vram')}',
+            [_series(tr('used'), Colors.purple, (p) => p.gpus[id]?.memUsed)],
+            format: formatMB,
+            maxY: last?.memTotal,
+            icon: Icons.memory,
+            subtitle: last?.memUsed != null
+                ? '${formatMB(last!.memUsed)} / ${formatMB(last.memTotal)}'
+                : null,
+          ),
+        );
+      }
+      if (_points.any((p) => p.gpus[id]?.power != null)) {
+        widgets.add(
+          _chartCard(
+            '$name · ${tr('power')}',
+            [
+              _series(tr('power'), Colors.amber, (p) => p.gpus[id]?.power),
+              if (_points.any((p) => p.gpus[id]?.packagePower != null))
+                _series(
+                  tr('package_power'),
+                  Colors.deepOrange,
+                  (p) => p.gpus[id]?.packagePower,
+                  fill: false,
+                ),
+            ],
+            format: (v) => '${v.toStringAsFixed(1)} W',
+            icon: Icons.bolt,
+          ),
+        );
+      }
+      if (last != null && last.engines.isNotEmpty) {
+        widgets.add(
+          SectionCard(
+            title: '$name · ${tr('engines')}',
+            icon: Icons.settings_input_component,
+            child: Column(
+              children: [
+                for (final e in last.engines.entries) ...[
+                  UsageBar(label: e.key, percent: e.value),
+                  const SizedBox(height: 8),
+                ],
+              ],
+            ),
+          ),
+        );
+      }
+    }
+    return widgets;
+  }
+
+  // ---------------------------------------------------------- containers
+
+  List<Widget> _containersTab() {
+    final running = _containers.where((c) => c.isRunning).length;
+    return [
+      Padding(
+        padding: const EdgeInsets.only(bottom: 8),
+        child: Text(
+          tr('containers_summary', args: ['${_containers.length}', '$running']),
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+      ),
+      for (final c in _containers)
+        Card(
+          margin: const EdgeInsets.only(bottom: 8),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(12),
+            onTap: () => _showContainer(c),
+            child: Padding(
+              padding: const EdgeInsets.all(12),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    item.label,
-                    style: Theme.of(context).textTheme.bodySmall,
+                  Row(
+                    children: [
+                      Icon(
+                        Icons.circle,
+                        size: 10,
+                        color: _healthColor(c),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          c.name,
+                          style: const TextStyle(fontWeight: FontWeight.bold),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      if (c.updatable)
+                        Pill(
+                          text: tr('update_available'),
+                          color: Colors.blue,
+                          icon: Icons.upgrade,
+                        ),
+                      if (c.health == 3) ...[
+                        const SizedBox(width: 4),
+                        Pill(text: tr('unhealthy'), color: Colors.red),
+                      ],
+                    ],
                   ),
-                  Text(
-                    item.value,
-                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                      fontWeight: FontWeight.bold,
+                  if (c.image.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 2, left: 18),
+                      child: Text(
+                        c.image,
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: Theme.of(context).colorScheme.outline,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
                     ),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 14,
+                    runSpacing: 4,
+                    children: [
+                      _miniStat(Icons.memory, formatPercent(c.cpu)),
+                      _miniStat(Icons.storage, formatMB(c.memory)),
+                      _miniStat(Icons.swap_vert, formatBytesRate(c.net)),
+                      _miniStat(Icons.schedule, c.status),
+                      if (c.ports.isNotEmpty)
+                        _miniStat(Icons.settings_ethernet, c.ports),
+                    ],
                   ),
                 ],
               ),
             ),
-          )
-          .toList(),
+          ),
+        ),
+    ];
+  }
+
+  Color _healthColor(ContainerInfo c) {
+    if (!c.isRunning) return Colors.grey;
+    switch (c.health) {
+      case 3:
+        return Colors.red;
+      case 1:
+        return Colors.amber;
+      default:
+        return Colors.green;
+    }
+  }
+
+  Widget _miniStat(IconData icon, String text) => Row(
+    mainAxisSize: MainAxisSize.min,
+    children: [
+      Icon(icon, size: 13, color: Colors.grey),
+      const SizedBox(width: 3),
+      Text(text, style: const TextStyle(fontSize: 12)),
+    ],
+  );
+
+  void _showContainer(ContainerInfo c) {
+    showModalBottomSheet(
+      context: context,
+      useSafeArea: true,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              title: Text(c.name, style: const TextStyle(fontWeight: FontWeight.bold)),
+              subtitle: Text(c.image),
+            ),
+            const Divider(height: 1),
+            ListTile(
+              leading: const Icon(Icons.article_outlined),
+              title: Text(tr('logs')),
+              onTap: () {
+                Navigator.pop(ctx);
+                showTextSheet(
+                  context,
+                  title: '${c.name} · ${tr('logs')}',
+                  load: () => _api.containerLogs(_system.id, c.id),
+                );
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.data_object),
+              title: Text(tr('details')),
+              onTap: () {
+                Navigator.pop(ctx);
+                showTextSheet(
+                  context,
+                  title: c.name,
+                  load: () => _api.containerInfo(_system.id, c.id),
+                );
+              },
+            ),
+          ],
+        ),
+      ),
     );
   }
 
-  Color _getUsageColor(double usage) {
-    if (usage < 50) return Colors.green;
-    if (usage < 80) return Colors.orange;
-    return Colors.red;
+  // ------------------------------------------------------------ services
+
+  List<Widget> _servicesTab() {
+    final failed = _services.where((s) => s.isFailed).length;
+    final q = _serviceFilter.toLowerCase();
+    final filtered = q.isEmpty
+        ? _services
+        : _services.where((s) => s.name.toLowerCase().contains(q)).toList();
+    return [
+      Row(
+        children: [
+          Expanded(
+            child: Text(
+              tr('services_summary', args: ['${_services.length}', '$failed']),
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+          ),
+        ],
+      ),
+      const SizedBox(height: 8),
+      TextField(
+        decoration: InputDecoration(
+          isDense: true,
+          prefixIcon: const Icon(Icons.search),
+          hintText: tr('search'),
+          border: const OutlineInputBorder(),
+        ),
+        onChanged: (v) => setState(() => _serviceFilter = v),
+      ),
+      const SizedBox(height: 8),
+      for (final s in filtered)
+        Card(
+          margin: const EdgeInsets.only(bottom: 6),
+          child: ListTile(
+            dense: true,
+            leading: Icon(
+              Icons.circle,
+              size: 12,
+              color: s.isFailed
+                  ? Colors.red
+                  : (s.state == 0 ? Colors.green : Colors.grey),
+            ),
+            title: Text(s.name, overflow: TextOverflow.ellipsis),
+            subtitle: Text('${s.stateName} (${s.subName})'),
+            trailing: Text(
+              'CPU ${formatPercent(s.cpu)}\n${formatBytes(s.memory)}',
+              textAlign: TextAlign.right,
+              style: const TextStyle(fontSize: 11),
+            ),
+            onTap: _system.journalAvailable
+                ? () => showTextSheet(
+                    context,
+                    title: '${s.name} · ${tr('logs')}',
+                    load: () => _api.serviceLogs(_system.id, s.name),
+                  )
+                : null,
+          ),
+        ),
+    ];
   }
 
-  String _formatUptime(int seconds) {
-    if (seconds <= 0) return '-';
-    final days = seconds ~/ 86400;
-    final hours = (seconds % 86400) ~/ 3600;
-    final mins = (seconds % 3600) ~/ 60;
-    if (days > 0) return '${days}d ${hours}h ${mins}m';
-    if (hours > 0) return '${hours}h ${mins}m';
-    return '${mins}m';
-  }
+  // --------------------------------------------------------------- smart
 
-  String _formatBytes(double bytes) {
-    if (bytes <= 0) return '0 B';
-    const suffixes = ['B', 'KB', 'MB', 'GB', 'TB'];
-    var i = 0;
-    while (bytes >= 1024 && i < suffixes.length - 1) {
-      bytes /= 1024;
-      i++;
+  Future<void> _refreshSmart() async {
+    setState(() => _smartRefreshing = true);
+    try {
+      await _api.refreshSmart(_system.id);
+      await Future.delayed(const Duration(seconds: 2));
+      await _loadSmart();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
+      }
+    } finally {
+      if (mounted) setState(() => _smartRefreshing = false);
     }
-    return '${bytes.toStringAsFixed(2)} ${suffixes[i]}';
   }
 
-  String _formatBytesSpeed(double bytesPerSec) {
-    return '${_formatBytes(bytesPerSec)}/s';
+  Color _smartColor(SmartDevice d) {
+    if (d.passed) return Colors.green;
+    if (d.failed) return Colors.red;
+    if (d.state.toUpperCase() == 'WARNING') return Colors.orange;
+    return Colors.grey;
   }
-}
 
-class _StatItem {
-  final String label;
-  final String value;
-  _StatItem(this.label, this.value);
+  List<Widget> _smartTab() {
+    return [
+      Align(
+        alignment: Alignment.centerRight,
+        child: TextButton.icon(
+          onPressed: _smartRefreshing ? null : _refreshSmart,
+          icon: _smartRefreshing
+              ? const SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Icon(Icons.refresh),
+          label: Text(tr('refresh')),
+        ),
+      ),
+      for (final d in _smart)
+        Card(
+          margin: const EdgeInsets.only(bottom: 8),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(12),
+            onTap: () => _showSmart(d),
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Icon(Icons.save_outlined, color: _smartColor(d)),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              d.name,
+                              style: const TextStyle(fontWeight: FontWeight.bold),
+                            ),
+                            Text(
+                              d.model,
+                              style: const TextStyle(fontSize: 12),
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ],
+                        ),
+                      ),
+                      Pill(
+                        text: d.state.isEmpty ? 'UNKNOWN' : d.state,
+                        color: _smartColor(d),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  Wrap(
+                    spacing: 14,
+                    runSpacing: 4,
+                    children: [
+                      if (d.temp != null && d.temp! > 0)
+                        _miniStat(Icons.thermostat, formatTemp(d.temp)),
+                      if (d.capacity > 0)
+                        _miniStat(Icons.sd_storage, formatBytes(d.capacity, decimals: 1)),
+                      _miniStat(Icons.timer_outlined, '${d.hours} h'),
+                      _miniStat(Icons.power_settings_new, '${d.cycles}'),
+                      if (d.type.isNotEmpty) _miniStat(Icons.cable, d.type.toUpperCase()),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+    ];
+  }
+
+  void _showSmart(SmartDevice device) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      builder: (ctx) => DraggableScrollableSheet(
+        expand: false,
+        initialChildSize: 0.8,
+        maxChildSize: 0.95,
+        builder: (ctx, controller) => FutureBuilder<RecordModel>(
+          future: PocketBaseService().pb
+              .collection('smart_devices')
+              .getOne(device.id),
+          builder: (ctx, snap) {
+            final d = snap.hasData
+                ? SmartDevice.fromRecord(snap.data!)
+                : device;
+            return ListView(
+              controller: controller,
+              padding: const EdgeInsets.all(16),
+              children: [
+                Text(d.name, style: Theme.of(ctx).textTheme.titleLarge),
+                const SizedBox(height: 12),
+                KeyValueGrid(
+                  items: [
+                    (tr('model'), d.model),
+                    (tr('serial'), d.serial),
+                    (tr('firmware'), d.firmware),
+                    (tr('capacity'), formatBytes(d.capacity, decimals: 1)),
+                    (tr('status'), d.state),
+                    (tr('temperature'), d.temp != null ? formatTemp(d.temp) : '-'),
+                    (tr('power_on_hours'), '${d.hours}'),
+                    (tr('power_cycles'), '${d.cycles}'),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                if (snap.connectionState != ConnectionState.done)
+                  const Center(child: CircularProgressIndicator())
+                else if (d.attributes.isEmpty)
+                  Text(tr('no_data'))
+                else
+                  SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: DataTable(
+                      columnSpacing: 14,
+                      headingRowHeight: 32,
+                      dataRowMinHeight: 28,
+                      dataRowMaxHeight: 36,
+                      columns: [
+                        const DataColumn(label: Text('ID')),
+                        DataColumn(label: Text(tr('attribute'))),
+                        DataColumn(label: Text(tr('value')), numeric: true),
+                        DataColumn(label: Text(tr('worst')), numeric: true),
+                        DataColumn(label: Text(tr('threshold')), numeric: true),
+                        DataColumn(label: Text(tr('raw'))),
+                      ],
+                      rows: [
+                        for (final a in d.attributes)
+                          DataRow(
+                            color: a.whenFailed != null
+                                ? WidgetStatePropertyAll(
+                                    Colors.red.withValues(alpha: 0.12),
+                                  )
+                                : null,
+                            cells: [
+                              DataCell(Text(a.id?.toString() ?? '')),
+                              DataCell(Text(a.name)),
+                              DataCell(Text(a.value?.toString() ?? '')),
+                              DataCell(Text(a.worst?.toString() ?? '')),
+                              DataCell(Text(a.threshold?.toString() ?? '')),
+                              DataCell(Text(a.rawValue)),
+                            ],
+                          ),
+                      ],
+                    ),
+                  ),
+              ],
+            );
+          },
+        ),
+      ),
+    );
+  }
 }

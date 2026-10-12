@@ -1,22 +1,67 @@
-import 'package:beszel_pro/models/system.dart';
 import 'dart:async';
-import 'package:beszel_pro/screens/system_detail_screen.dart';
-import 'package:beszel_pro/services/pocketbase_service.dart';
-import 'package:flutter/material.dart';
-import 'package:beszel_pro/screens/setup_screen.dart';
 
+import 'package:beszel_pro/models/records.dart';
+import 'package:beszel_pro/models/system.dart';
 import 'package:beszel_pro/providers/app_provider.dart';
-import 'package:provider/provider.dart';
-import 'package:shared_preferences/shared_preferences.dart';
-import 'package:easy_localization/easy_localization.dart';
-import 'package:beszel_pro/services/notification_service.dart';
-import 'package:beszel_pro/services/alert_manager.dart';
 import 'package:beszel_pro/screens/alerts_screen.dart';
 import 'package:beszel_pro/screens/appearance_screen.dart';
+import 'package:beszel_pro/screens/setup_screen.dart';
+import 'package:beszel_pro/screens/system_detail_screen.dart';
 import 'package:beszel_pro/screens/user_info_screen.dart';
+import 'package:beszel_pro/services/alert_manager.dart';
+import 'package:beszel_pro/services/beszel_api.dart';
+import 'package:beszel_pro/services/biometric_service.dart';
+import 'package:beszel_pro/services/notification_service.dart';
 import 'package:beszel_pro/services/pin_service.dart';
+import 'package:beszel_pro/services/pocketbase_service.dart';
+import 'package:beszel_pro/utils/format.dart';
+import 'package:beszel_pro/widgets/common.dart';
+import 'package:beszel_pro/widgets/language_menu.dart';
+import 'package:easy_localization/easy_localization.dart';
+import 'package:flutter/material.dart';
+import 'package:pocketbase/pocketbase.dart';
+import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
-enum SortOption { name, cpu, ram, disk }
+enum SortOption { name, status, cpu, ram, disk }
+
+enum StatusFilter { all, up, down, paused }
+
+/// Signs the user out and returns to the server setup screen.
+Future<void> performLogout(BuildContext context) async {
+  final confirmed = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: Text(tr('logout')),
+      content: Text(tr('logout_confirm')),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(ctx, false),
+          child: Text(tr('cancel')),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(ctx, true),
+          child: Text(tr('logout')),
+        ),
+      ],
+    ),
+  );
+  if (confirmed != true || !context.mounted) return;
+
+  final navigator = Navigator.of(context, rootNavigator: true);
+  try {
+    await PocketBaseService().logout();
+    await PinService().removePin();
+    await BiometricService().setBiometricEnabled(false);
+    await AlertManager().clearAlerts();
+  } catch (e) {
+    debugPrint('Logout cleanup error: $e');
+  }
+  navigator.pushAndRemoveUntil(
+    MaterialPageRoute(builder: (_) => const SetupScreen()),
+    (route) => false,
+  );
+}
 
 class DashboardScreen extends StatefulWidget {
   const DashboardScreen({super.key});
@@ -26,188 +71,114 @@ class DashboardScreen extends StatefulWidget {
 }
 
 class _DashboardScreenState extends State<DashboardScreen> {
+  static const _sortKey = 'dashboard_sort';
+
+  final _api = BeszelApi();
   List<System> _systems = [];
-  Map<String, List<int>> _cumulativeTraffic = {}; // systemId -> [sent, recv]
+  Map<String, List<double>> _cumulativeTraffic = {}; // systemId -> [sent, recv]
   bool _isLoading = true;
   bool _isOffline = false;
   String? _error;
-  SortOption _currentSort = SortOption.name; // Default sort
+  SortOption _currentSort = SortOption.name;
+  StatusFilter _statusFilter = StatusFilter.all;
+  String _query = '';
+  bool _searching = false;
   Timer? _pollingTimer;
+  UnsubscribeFunc? _systemsUnsub;
+  UnsubscribeFunc? _alertsUnsub;
+  int _activeHubAlerts = 0;
 
-  void _sortSystems() {
-    switch (_currentSort) {
-      case SortOption.name:
-        _systems.sort((a, b) => a.name.compareTo(b.name));
-        break;
-      case SortOption.cpu:
-        // Descending for metrics usually makes more sense
-        _systems.sort((a, b) => b.cpuPercent.compareTo(a.cpuPercent));
-        break;
-      case SortOption.ram:
-        _systems.sort((a, b) => b.memoryPercent.compareTo(a.memoryPercent));
-        break;
-      case SortOption.disk:
-        _systems.sort((a, b) => b.diskPercent.compareTo(a.diskPercent));
-        break;
-    }
-  }
+  /// Keys (`systemId:type`) of local threshold alerts currently raised,
+  /// so each condition notifies once until it clears again.
+  final Set<String> _raised = {};
 
   @override
   void initState() {
     super.initState();
-    debugPrint('Dashboard: initState');
-
-    // Defer heavy services until after the first frame rendered
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      debugPrint('Dashboard: PostFrameCallback - Starting Services');
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      final prefs = await SharedPreferences.getInstance();
+      final sort = prefs.getString(_sortKey);
+      _currentSort = SortOption.values.firstWhere(
+        (s) => s.name == sort,
+        orElse: () => SortOption.name,
+      );
       NotificationService().initialize();
       AlertManager().loadAlerts();
-      _fetchSystems();
+      await _fetchSystems();
       _subscribeToRealtime();
-
-      // Polling fallback: every 5 seconds
-      _pollingTimer = Timer.periodic(const Duration(seconds: 5), (timer) {
-        _pollSystems();
-      });
+      _subscribeToHubAlerts();
+      _pollingTimer = Timer.periodic(
+        const Duration(seconds: 30),
+        (_) => _pollSystems(),
+      );
     });
-  }
-
-  Future<void> _pollSystems() async {
-    // Silent fetch
-    try {
-      final pb = PocketBaseService().pb;
-      final records = await pb
-          .collection('systems')
-          .getFullList(sort: '-updated');
-      if (!mounted) return;
-
-      final newSystems = records.map((r) => System.fromRecord(r)).toList();
-      setState(() {
-        for (var newSys in newSystems) {
-          final index = _systems.indexWhere((s) => s.id == newSys.id);
-          if (index != -1) {
-            final oldSys = _systems[index];
-            _checkAlerts(oldSys, newSys);
-            _systems[index] = newSys;
-          } else {
-            _systems.add(newSys);
-          }
-        }
-        _sortSystems();
-      });
-    } catch (_) {}
-  }
-
-  void _checkAlerts(System oldSystem, System newSystem) {
-    if (Provider.of<AlertManager>(context, listen: false).alerts.isNotEmpty)
-      return;
-    // 1. Check for DOWN status
-    if (oldSystem.status == 'up' && newSystem.status == 'down') {
-      _triggerAlert(
-        newSystem,
-        tr('alert_system_down_title'),
-        tr('alert_system_down_body', args: [newSystem.name]),
-        'error',
-      );
-    }
-    // 2. Check for High CPU (80%)
-    if (newSystem.cpuPercent > 80 && oldSystem.cpuPercent <= 80) {
-      _triggerAlert(
-        newSystem,
-        tr('alert_high_cpu_title'),
-        tr(
-          'alert_high_cpu_body',
-          args: [newSystem.name, newSystem.cpuPercent.toStringAsFixed(1)],
-        ),
-        'warning',
-      );
-    }
-    // 3. Check for High RAM (80%)
-    if (newSystem.memoryPercent > 80 && oldSystem.memoryPercent <= 80) {
-      _triggerAlert(
-        newSystem,
-        tr('alert_high_ram_title'),
-        tr(
-          'alert_high_ram_body',
-          args: [newSystem.name, newSystem.memoryPercent.toStringAsFixed(1)],
-        ),
-        'warning',
-      );
-    }
-    // 4. Check for High Disk (80%)
-    if (newSystem.diskPercent > 80 && oldSystem.diskPercent <= 80) {
-      _triggerAlert(
-        newSystem,
-        tr('alert_high_disk_title'),
-        tr(
-          'alert_high_disk_body',
-          args: [newSystem.name, newSystem.diskPercent.toStringAsFixed(1)],
-        ),
-        'warning',
-      );
-    }
-  }
-
-  void _checkInitialAlerts() {
-    if (Provider.of<AlertManager>(context, listen: false).alerts.isNotEmpty)
-      return;
-    for (final system in _systems) {
-      // 1. Check for DOWN status
-      if (system.status == 'down') {
-        _triggerAlert(
-          system,
-          tr('alert_system_down_title'),
-          tr('alert_system_down_body', args: [system.name]),
-          'error',
-        );
-      }
-      // 2. Check for High CPU (80%)
-      if (system.cpuPercent > 80) {
-        _triggerAlert(
-          system,
-          tr('alert_high_cpu_title'),
-          tr(
-            'alert_high_cpu_body',
-            args: [system.name, system.cpuPercent.toStringAsFixed(1)],
-          ),
-          'warning',
-        );
-      }
-      // 3. Check for High RAM (80%)
-      if (system.memoryPercent > 80) {
-        _triggerAlert(
-          system,
-          tr('alert_high_ram_title'),
-          tr(
-            'alert_high_ram_body',
-            args: [system.name, system.memoryPercent.toStringAsFixed(1)],
-          ),
-          'warning',
-        );
-      }
-      // 4. Check for High Disk (80%)
-      if (system.diskPercent > 80) {
-        _triggerAlert(
-          system,
-          tr('alert_high_disk_title'),
-          tr(
-            'alert_high_disk_body',
-            args: [system.name, system.diskPercent.toStringAsFixed(1)],
-          ),
-          'warning',
-        );
-      }
-    }
   }
 
   @override
   void dispose() {
     _pollingTimer?.cancel();
-    _unsubscribeFromRealtime();
+    _unsubscribe(_systemsUnsub);
+    _unsubscribe(_alertsUnsub);
     super.dispose();
   }
 
-  Future<void> _fetchSystems() async {
+  void _unsubscribe(UnsubscribeFunc? f) {
+    if (f == null) return;
+    f().catchError((_) {});
+  }
+
+  // ---------------------------------------------------------------- data
+
+  void _sortSystems() {
+    int byName(System a, System b) =>
+        a.name.toLowerCase().compareTo(b.name.toLowerCase());
+    switch (_currentSort) {
+      case SortOption.name:
+        _systems.sort(byName);
+      case SortOption.status:
+        const order = {'down': 0, 'pending': 1, 'up': 2, 'paused': 3};
+        _systems.sort((a, b) {
+          final c = (order[a.status] ?? 9).compareTo(order[b.status] ?? 9);
+          return c != 0 ? c : byName(a, b);
+        });
+      case SortOption.cpu:
+        _systems.sort((a, b) => b.cpuPercent.compareTo(a.cpuPercent));
+      case SortOption.ram:
+        _systems.sort((a, b) => b.memoryPercent.compareTo(a.memoryPercent));
+      case SortOption.disk:
+        _systems.sort((a, b) => b.diskPercent.compareTo(a.diskPercent));
+    }
+  }
+
+  List<System> get _visibleSystems {
+    final q = _query.trim().toLowerCase();
+    return _systems.where((s) {
+      if (_statusFilter == StatusFilter.up && !s.isUp) return false;
+      if (_statusFilter == StatusFilter.down && !s.isDown) return false;
+      if (_statusFilter == StatusFilter.paused && !s.isPaused) return false;
+      if (q.isEmpty) return true;
+      return s.name.toLowerCase().contains(q) ||
+          s.host.toLowerCase().contains(q) ||
+          (s.agentVersion ?? '').contains(q);
+    }).toList();
+  }
+
+  Future<void> _pollSystems() async {
+    try {
+      final newSystems = await _api.fetchSystems();
+      if (!mounted) return;
+      setState(() {
+        for (final s in newSystems) {
+          _checkAlerts(s);
+        }
+        _systems = newSystems;
+        _sortSystems();
+      });
+      _fetchActiveHubAlerts();
+    } catch (_) {}
+  }
+
+  Future<void> _fetchSystems({bool retried = false}) async {
     if (mounted) {
       setState(() {
         _isOffline = false;
@@ -216,101 +187,214 @@ class _DashboardScreenState extends State<DashboardScreen> {
     }
 
     try {
-      final pb = PocketBaseService().pb;
-      final records = await pb
-          .collection('systems')
-          .getFullList(sort: '-updated');
-
-      if (records.isNotEmpty) {
-        debugPrint('SYSTEM RECORD RAW DATA: ${records.first.data}');
-      }
-
-      if (mounted) {
-        setState(() {
-          _systems = records.map((r) => System.fromRecord(r)).toList();
-          _sortSystems();
-          _checkInitialAlerts();
-          _isLoading = false;
-        });
-
-        // Fetch cumulative traffic for each system (in background)
-        _fetchCumulativeTraffic();
-      }
+      final systems = await _api.fetchSystems();
+      if (!mounted) return;
+      setState(() {
+        _systems = systems;
+        _sortSystems();
+        for (final s in _systems) {
+          _checkAlerts(s);
+        }
+        _isLoading = false;
+      });
+      _fetchCumulativeTraffic();
+      _fetchActiveHubAlerts();
     } catch (e) {
-      if (mounted) {
-        final errString = e.toString();
-        debugPrint('Fetch error: $errString');
-        setState(() {
-          if (errString.contains('ClientException') ||
-              errString.contains('SocketException') ||
-              errString.contains('Failed host lookup')) {
-            _isOffline = true;
-          } else {
-            _error = 'Failed to load systems: $e';
-          }
-          _isLoading = false;
-        });
+      if (!mounted) return;
+      final errString = e.toString();
+      debugPrint('Fetch error: $errString');
+      if (!retried &&
+          e is ClientException &&
+          (e.statusCode == 401 || e.statusCode == 403)) {
+        // Session expired or revoked - try to refresh the auth token once.
+        var refreshed = false;
+        try {
+          await PocketBaseService().pb.collection('users').authRefresh();
+          refreshed = true;
+        } catch (_) {}
+        if (refreshed) return _fetchSystems(retried: true);
       }
+      setState(() {
+        if (e is ClientException && e.statusCode == 0) {
+          _isOffline = true;
+        } else {
+          _error = '${tr('failed_load_systems')}\n$e';
+        }
+        _isLoading = false;
+      });
     }
+  }
+
+  Future<void> _fetchActiveHubAlerts() async {
+    try {
+      final pb = PocketBaseService().pb;
+      final res = await pb
+          .collection('alerts_history')
+          .getList(page: 1, perPage: 1, filter: 'resolved = null', fields: 'id');
+      if (mounted) setState(() => _activeHubAlerts = res.totalItems);
+    } catch (_) {}
   }
 
   Future<void> _fetchCumulativeTraffic() async {
-    // Fetch cumulative traffic for each system from system_stats collection
-    // Cumulative data is in stats['ni'] (NetworkInterfaces) as:
-    // { "eth0": [upDelta, downDelta, totalBytesSent, totalBytesRecv], ... }
-    try {
-      final pb = PocketBaseService().pb;
-      final Map<String, List<int>> trafficMap = {};
-
-      for (final system in _systems) {
-        try {
-          // Get the latest stats record for this system
-          final statsRecords = await pb
-              .collection('system_stats')
-              .getList(
-                page: 1,
-                perPage: 1,
-                filter: 'system = "${system.id}"',
-                sort: '-created',
-              );
-
-          if (statsRecords.items.isNotEmpty) {
-            final stats = statsRecords.items.first.data['stats'];
-            if (stats != null && stats['ni'] != null) {
-              // ni = NetworkInterfaces map
-              // Each interface: [upDelta, downDelta, totalBytesSent, totalBytesRecv]
-              final ni = stats['ni'];
-              if (ni is Map) {
-                int totalSent = 0;
-                int totalRecv = 0;
-                ni.forEach((key, value) {
-                  if (value is List && value.length >= 4) {
-                    totalSent += ((value[2] is num)
-                        ? (value[2] as num).toInt()
-                        : 0);
-                    totalRecv += ((value[3] is num)
-                        ? (value[3] as num).toInt()
-                        : 0);
-                  }
-                });
-                trafficMap[system.id] = [totalSent, totalRecv];
-              }
-            }
+    final pb = PocketBaseService().pb;
+    final Map<String, List<double>> trafficMap = {};
+    for (final system in List<System>.of(_systems)) {
+      if (!system.isUp) continue;
+      try {
+        final res = await pb
+            .collection('system_stats')
+            .getList(
+              page: 1,
+              perPage: 1,
+              filter: pb.filter('system = {:id} && type = "1m"', {
+                'id': system.id,
+              }),
+              sort: '-created',
+              fields: 'stats.ni',
+            );
+        if (res.items.isEmpty) continue;
+        final ni = asMap(asMap(res.items.first.data['stats'])['ni']);
+        double sent = 0, recv = 0;
+        for (final v in ni.values) {
+          final l = asDoubleList(v);
+          if (l.length >= 4) {
+            sent += l[2];
+            recv += l[3];
           }
-        } catch (e) {
-          debugPrint('Failed to fetch stats for ${system.name}: $e');
         }
+        trafficMap[system.id] = [sent, recv];
+      } catch (e) {
+        debugPrint('Failed to fetch stats for ${system.name}: $e');
       }
+    }
+    if (mounted) setState(() => _cumulativeTraffic = trafficMap);
+  }
 
-      if (mounted) {
-        setState(() {
-          _cumulativeTraffic = trafficMap;
-        });
-      }
+  Future<void> _subscribeToRealtime() async {
+    try {
+      _systemsUnsub = await PocketBaseService().pb
+          .collection('systems')
+          .subscribe('*', (e) {
+            if (!mounted || e.record == null) return;
+            final sys = System.fromRecord(e.record!);
+            setState(() {
+              final index = _systems.indexWhere((s) => s.id == sys.id);
+              if (e.action == 'delete') {
+                _systems.removeWhere((s) => s.id == sys.id);
+              } else if (index == -1) {
+                _systems.add(sys);
+              } else {
+                _checkAlerts(sys);
+                _systems[index] = sys;
+              }
+              _sortSystems();
+            });
+          });
     } catch (e) {
-      debugPrint('Failed to fetch cumulative traffic: $e');
+      debugPrint('Realtime subscription failed: $e');
     }
   }
+
+  /// Hub alerts (configured in the Beszel web UI) arrive as
+  /// `alerts_history` records - surface them as notifications.
+  Future<void> _subscribeToHubAlerts() async {
+    try {
+      _alertsUnsub = await PocketBaseService().pb
+          .collection('alerts_history')
+          .subscribe('*', (e) {
+            if (!mounted || e.record == null) return;
+            _fetchActiveHubAlerts();
+            if (e.action != 'create') return;
+            final event = HubAlertEvent.fromRecord(e.record!);
+            final system = _systems.where((s) => s.id == event.systemId);
+            final systemName = system.isNotEmpty
+                ? system.first.name
+                : event.systemName;
+            final title = tr('hub_alert_title', args: [systemName]);
+            final body = describeHubAlert(event);
+            NotificationService().showNotification(
+              id: event.id.hashCode,
+              title: title,
+              body: body,
+            );
+            AlertManager().addAlert(title, body, 'error', systemName);
+          });
+    } catch (e) {
+      debugPrint('Alert subscription failed: $e');
+    }
+  }
+
+  // -------------------------------------------------------- local alerts
+
+  void _checkAlerts(System s) {
+    if (s.isPaused || s.isPending) {
+      _raised.removeWhere((k) => k.startsWith('${s.id}:'));
+      return;
+    }
+    _evaluate(
+      s,
+      'down',
+      s.isDown,
+      tr('alert_system_down_title'),
+      tr('alert_system_down_body', args: [s.name]),
+      'error',
+    );
+    if (!s.isUp) return;
+    _evaluate(
+      s,
+      'cpu',
+      s.cpuPercent > 80,
+      tr('alert_high_cpu_title'),
+      tr('alert_high_cpu_body', args: [s.name, s.cpuPercent.toStringAsFixed(1)]),
+      'warning',
+    );
+    _evaluate(
+      s,
+      'ram',
+      s.memoryPercent > 80,
+      tr('alert_high_ram_title'),
+      tr(
+        'alert_high_ram_body',
+        args: [s.name, s.memoryPercent.toStringAsFixed(1)],
+      ),
+      'warning',
+    );
+    _evaluate(
+      s,
+      'disk',
+      s.diskPercent > 80,
+      tr('alert_high_disk_title'),
+      tr(
+        'alert_high_disk_body',
+        args: [s.name, s.diskPercent.toStringAsFixed(1)],
+      ),
+      'warning',
+    );
+  }
+
+  void _evaluate(
+    System s,
+    String type,
+    bool condition,
+    String title,
+    String body,
+    String level,
+  ) {
+    final key = '${s.id}:$type';
+    if (!condition) {
+      _raised.remove(key);
+      return;
+    }
+    if (!_raised.add(key)) return;
+    NotificationService().showNotification(
+      id: key.hashCode,
+      title: title,
+      body: body,
+    );
+    AlertManager().addAlert(title, body, level, s.name);
+  }
+
+  // ------------------------------------------------------------------ ui
 
   Widget _buildOfflineWidget() {
     return Center(
@@ -324,135 +408,43 @@ class _DashboardScreenState extends State<DashboardScreen> {
             style: const TextStyle(fontSize: 18, color: Colors.grey),
           ),
           const SizedBox(height: 24),
-          ElevatedButton.icon(
+          FilledButton.icon(
             onPressed: () {
-              setState(() {
-                _isLoading = true;
-                _isOffline = false;
-                _error = null;
-              });
+              setState(() => _isLoading = true);
               _fetchSystems();
             },
             icon: const Icon(Icons.refresh),
-            label: Text(
-              tr('refresh'),
-            ), // Fallback if 'refresh' key missing, though ideally add to en.json too or use Icon button
+            label: Text(tr('refresh')),
           ),
         ],
       ),
     );
   }
 
-  // Summary card showing aggregated statistics
-  Widget _buildSummaryCard(BuildContext context) {
-    // Calculate server counts
-    final totalServers = _systems.length;
-    final onlineServers = _systems.where((s) => s.status == 'up').length;
-    final offlineServers = totalServers - onlineServers;
-
-    // Calculate total real-time bandwidth (sum of all info['bb'])
-    double totalBandwidth = 0;
-    for (final sys in _systems) {
-      if (sys.info['bb'] != null && sys.info['bb'] is num) {
-        totalBandwidth += (sys.info['bb'] as num).toDouble();
-      }
-    }
-
-    // Calculate total cumulative traffic (sum of all cumulativeTraffic)
-    int totalSent = 0;
-    int totalRecv = 0;
-    for (final sys in _systems) {
-      final traffic = _cumulativeTraffic[sys.id];
-      if (traffic != null && traffic.length >= 2) {
-        totalSent += traffic[0];
-        totalRecv += traffic[1];
-      }
-    }
-
-    // Format bytes helper (inline version for this widget)
-    String formatBytes(double bytes) {
-      if (bytes <= 0) return '0 B';
-      const suffixes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
-      var i = 0;
-      while (bytes >= 1024 && i < suffixes.length - 1) {
-        bytes /= 1024;
-        i++;
-      }
-      return '${bytes.toStringAsFixed(2)} ${suffixes[i]}';
-    }
-
-    return Card(
-      margin: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
-      elevation: 2,
-      color: Theme.of(context).colorScheme.primaryContainer.withOpacity(0.3),
+  Widget _buildErrorWidget() {
+    return Center(
       child: Padding(
-        padding: const EdgeInsets.all(16.0),
+        padding: const EdgeInsets.all(24),
         child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
           children: [
-            Row(
-              children: [
-                Icon(Icons.dns, color: Theme.of(context).colorScheme.primary),
-                const SizedBox(width: 8),
-                Text(
-                  tr('summary'),
-                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-              ],
+            Text(
+              _error!,
+              style: const TextStyle(color: Colors.red),
+              textAlign: TextAlign.center,
             ),
-            const SizedBox(height: 12),
-            // Server counts
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceAround,
-              children: [
-                _buildStatItem(
-                  context,
-                  tr('total'),
-                  totalServers.toString(),
-                  Colors.blue,
-                ),
-                _buildStatItem(
-                  context,
-                  tr('online'),
-                  onlineServers.toString(),
-                  Colors.green,
-                ),
-                _buildStatItem(
-                  context,
-                  tr('offline'),
-                  offlineServers.toString(),
-                  Colors.red,
-                ),
-              ],
+            const SizedBox(height: 16),
+            FilledButton.icon(
+              onPressed: () {
+                setState(() => _isLoading = true);
+                _fetchSystems();
+              },
+              icon: const Icon(Icons.refresh),
+              label: Text(tr('refresh')),
             ),
-            const SizedBox(height: 12),
-            const Divider(),
-            const SizedBox(height: 8),
-            // Network stats
-            Row(
-              children: [
-                const Icon(Icons.network_check, size: 18),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    '${tr('bandwidth')}: ${formatBytes(totalBandwidth)}/s',
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 4),
-            Row(
-              children: [
-                const Icon(Icons.data_usage, size: 18),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    '${tr('traffic')}: ↑${formatBytes(totalSent.toDouble())} / ↓${formatBytes(totalRecv.toDouble())}',
-                  ),
-                ),
-              ],
+            TextButton(
+              onPressed: () => performLogout(context),
+              child: Text(tr('logout')),
             ),
           ],
         ),
@@ -460,193 +452,227 @@ class _DashboardScreenState extends State<DashboardScreen> {
     );
   }
 
-  Widget _buildStatItem(
-    BuildContext context,
-    String label,
-    String value,
-    Color color,
-  ) {
-    return Column(
-      children: [
-        Text(
-          value,
-          style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-            fontWeight: FontWeight.bold,
-            color: color,
+  Widget _buildSummaryCard(BuildContext context) {
+    final total = _systems.length;
+    final up = _systems.where((s) => s.isUp).length;
+    final down = _systems.where((s) => s.isDown).length;
+    final paused = _systems.where((s) => s.isPaused).length;
+
+    double totalBandwidth = 0;
+    for (final sys in _systems) {
+      totalBandwidth += sys.bandwidth;
+    }
+    double totalSent = 0, totalRecv = 0;
+    for (final t in _cumulativeTraffic.values) {
+      totalSent += t[0];
+      totalRecv += t[1];
+    }
+
+    Widget stat(String label, int value, Color color, StatusFilter filter) {
+      final selected = _statusFilter == filter;
+      return InkWell(
+        borderRadius: BorderRadius.circular(8),
+        onTap: () => setState(
+          () => _statusFilter = selected ? StatusFilter.all : filter,
+        ),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(8),
+            border: selected ? Border.all(color: color) : null,
+          ),
+          child: Column(
+            children: [
+              Text(
+                '$value',
+                style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                  fontWeight: FontWeight.bold,
+                  color: color,
+                ),
+              ),
+              Text(label, style: Theme.of(context).textTheme.bodySmall),
+            ],
           ),
         ),
-        Text(label, style: Theme.of(context).textTheme.bodySmall),
-      ],
-    );
-  }
-
-  // ...
-
-  Future<void> _subscribeToRealtime() async {
-    try {
-      final pb = PocketBaseService().pb;
-      pb.collection('systems').subscribe('*', (e) {
-        if (!mounted) return;
-
-        if (e.action == 'create') {
-          setState(() {
-            _systems.insert(0, System.fromRecord(e.record!));
-          });
-        } else if (e.action == 'update') {
-          debugPrint('REALTIME EVENT: ${e.record!.data}');
-          final updatedSystem = System.fromRecord(e.record!);
-          debugPrint(
-            'UPDATED STATS: CPU=${updatedSystem.cpuPercent}, RAM=${updatedSystem.memoryPercent}',
-          );
-
-          setState(() {
-            final index = _systems.indexWhere((s) => s.id == e.record!.id);
-            if (index != -1) {
-              final oldSystem = _systems[index];
-              _checkAlerts(oldSystem, updatedSystem);
-              _systems[index] = updatedSystem;
-              _sortSystems();
-            }
-          });
-        } else if (e.action == 'delete') {
-          setState(() {
-            _systems.removeWhere((s) => s.id == e.record!.id);
-          });
-        }
-      });
-    } catch (e) {
-      debugPrint('Realtime subscription failed: $e');
-    }
-  }
-
-  void _triggerAlert(System system, String title, String body, String type) {
-    // Show local notification
-    NotificationService().showNotification(
-      id: system.id.hashCode,
-      title: title,
-      body: body,
-    );
-
-    // Save to history
-    AlertManager().addAlert(title, body, type, system.name);
-  }
-
-  Future<void> _unsubscribeFromRealtime() async {
-    try {
-      final pb = PocketBaseService().pb;
-      await pb.collection('systems').unsubscribe('*');
-    } catch (_) {}
-  }
-
-  void _logout() async {
-    final pb = PocketBaseService().pb;
-    pb.authStore.clear();
-
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove('pb_url');
-    await PinService().removePin();
-
-    if (mounted) {
-      Navigator.of(context).pushAndRemoveUntil(
-        MaterialPageRoute(builder: (_) => const SetupScreen()),
-        (route) => false,
       );
     }
+
+    return Card(
+      margin: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
+      elevation: 0,
+      color: Theme.of(
+        context,
+      ).colorScheme.primaryContainer.withValues(alpha: 0.35),
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceAround,
+              children: [
+                stat(tr('total'), total, Colors.blue, StatusFilter.all),
+                stat(tr('online'), up, Colors.green, StatusFilter.up),
+                stat(tr('offline'), down, Colors.red, StatusFilter.down),
+                if (paused > 0)
+                  stat(
+                    tr('status_paused'),
+                    paused,
+                    Colors.blueGrey,
+                    StatusFilter.paused,
+                  ),
+              ],
+            ),
+            const Divider(height: 24),
+            Row(
+              children: [
+                const Icon(Icons.network_check, size: 18),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    '${tr('bandwidth')}: ${formatBytesRate(totalBandwidth)}',
+                  ),
+                ),
+              ],
+            ),
+            if (_cumulativeTraffic.isNotEmpty) ...[
+              const SizedBox(height: 4),
+              Row(
+                children: [
+                  const Icon(Icons.data_usage, size: 18),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      '${tr('traffic')}: ↑${formatBytes(totalSent)} / ↓${formatBytes(totalRecv)}',
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showSortSheet() {
+    showModalBottomSheet(
+      context: context,
+      builder: (context) {
+        Widget option(SortOption o, IconData icon, String label) => ListTile(
+          leading: Icon(icon),
+          title: Text(label),
+          trailing: _currentSort == o ? const Icon(Icons.check) : null,
+          onTap: () async {
+            setState(() {
+              _currentSort = o;
+              _sortSystems();
+            });
+            Navigator.pop(context);
+            final prefs = await SharedPreferences.getInstance();
+            await prefs.setString(_sortKey, o.name);
+          },
+        );
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              option(SortOption.name, Icons.sort_by_alpha, tr('sort_name')),
+              option(SortOption.status, Icons.traffic, tr('status')),
+              option(SortOption.cpu, Icons.memory, tr('sort_cpu')),
+              option(SortOption.ram, Icons.storage, tr('sort_ram')),
+              option(SortOption.disk, Icons.donut_large, tr('disk')),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  void _onMenu(String value) {
+    switch (value) {
+      case 'user':
+        Navigator.of(
+          context,
+        ).push(MaterialPageRoute(builder: (_) => const UserInfoScreen()));
+      case 'theme':
+        final provider = Provider.of<AppProvider>(context, listen: false);
+        provider.toggleTheme(
+          Theme.of(context).brightness != Brightness.dark,
+        );
+      case 'language':
+        showLanguageDialog(context);
+      case 'appearance':
+        Navigator.of(context).push(
+          MaterialPageRoute(
+            builder: (_) => const AppearanceScreen(fromSettings: true),
+          ),
+        );
+      case 'logout':
+        performLogout(context);
+    }
+  }
+
+  PopupMenuItem<String> _menuItem(String value, IconData icon, String label) {
+    return PopupMenuItem<String>(
+      value: value,
+      child: Row(
+        children: [
+          Icon(icon, size: 20),
+          const SizedBox(width: 12),
+          Text(label),
+        ],
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
     return Scaffold(
       appBar: AppBar(
-        title: Text(tr('dashboard')),
+        title: _searching
+            ? TextField(
+                autofocus: true,
+                decoration: InputDecoration(
+                  hintText: tr('search'),
+                  border: InputBorder.none,
+                ),
+                onChanged: (v) => setState(() => _query = v),
+              )
+            : Text(tr('dashboard')),
         actions: [
           IconButton(
+            icon: Icon(_searching ? Icons.close : Icons.search),
+            tooltip: tr('search'),
+            onPressed: () => setState(() {
+              _searching = !_searching;
+              if (!_searching) _query = '';
+            }),
+          ),
+          IconButton(
             icon: const Icon(Icons.sort),
-            tooltip: 'Sort by',
-            onPressed: () {
-              showModalBottomSheet(
-                context: context,
-                builder: (context) {
-                  return Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      ListTile(
-                        leading: const Icon(Icons.sort_by_alpha),
-                        title: Text(tr('sort_name')),
-                        trailing: _currentSort == SortOption.name
-                            ? const Icon(Icons.check)
-                            : null,
-                        onTap: () {
-                          setState(() {
-                            _currentSort = SortOption.name;
-                            _sortSystems();
-                          });
-                          Navigator.pop(context);
-                        },
-                      ),
-                      ListTile(
-                        leading: const Icon(Icons.memory),
-                        title: Text(tr('sort_cpu')),
-                        trailing: _currentSort == SortOption.cpu
-                            ? const Icon(Icons.check)
-                            : null,
-                        onTap: () {
-                          setState(() {
-                            _currentSort = SortOption.cpu;
-                            _sortSystems();
-                          });
-                          Navigator.pop(context);
-                        },
-                      ),
-                      ListTile(
-                        leading: const Icon(Icons.storage),
-                        title: Text(tr('sort_ram')),
-                        trailing: _currentSort == SortOption.ram
-                            ? const Icon(Icons.check)
-                            : null,
-                        onTap: () {
-                          setState(() {
-                            _currentSort = SortOption.ram;
-                            _sortSystems();
-                          });
-                          Navigator.pop(context);
-                        },
-                      ),
-                      ListTile(
-                        leading: const Icon(Icons.donut_large),
-                        title: Text(
-                          tr('disk'),
-                        ), // reused translation or key 'disk'
-                        trailing: _currentSort == SortOption.disk
-                            ? const Icon(Icons.check)
-                            : null,
-                        onTap: () {
-                          setState(() {
-                            _currentSort = SortOption.disk;
-                            _sortSystems();
-                          });
-                          Navigator.pop(context);
-                        },
-                      ),
-                    ],
-                  );
-                },
-              );
-            },
+            tooltip: tr('sort_by'),
+            onPressed: _showSortSheet,
           ),
           Consumer<AlertManager>(
             builder: (context, alertManager, child) {
+              final count = alertManager.alerts.length + _activeHubAlerts;
               return IconButton(
                 icon: Badge(
-                  isLabelVisible: alertManager.alerts.isNotEmpty,
+                  isLabelVisible: count > 0,
+                  label: _activeHubAlerts > 0 ? Text('$_activeHubAlerts') : null,
                   smallSize: 10,
                   child: const Icon(Icons.notifications),
                 ),
-                tooltip: 'Alerts',
-                onPressed: () {
-                  Navigator.of(context).push(
-                    MaterialPageRoute(builder: (_) => const AlertsScreen()),
+                tooltip: tr('alerts'),
+                onPressed: () async {
+                  await Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) => AlertsScreen(systems: _systems),
+                    ),
                   );
+                  _fetchActiveHubAlerts();
                 },
               );
             },
@@ -654,113 +680,18 @@ class _DashboardScreenState extends State<DashboardScreen> {
           PopupMenuButton<String>(
             icon: const Icon(Icons.account_circle),
             tooltip: 'menu_user'.tr(),
-            onSelected: (String value) {
-              switch (value) {
-                case 'user':
-                  Navigator.of(context).push(
-                    MaterialPageRoute(builder: (_) => const UserInfoScreen()),
-                  );
-                  break;
-                case 'theme':
-                  final provider = Provider.of<AppProvider>(
-                    context,
-                    listen: false,
-                  );
-                  provider.toggleTheme(provider.themeMode != ThemeMode.dark);
-                  break;
-                case 'language':
-                  // Show language selector
-                  showDialog(
-                    context: context,
-                    builder: (BuildContext context) {
-                      return SimpleDialog(
-                        title: Text('select_language'.tr()),
-                        children: [
-                          SimpleDialogOption(
-                            onPressed: () {
-                              context.setLocale(const Locale('en'));
-                              Navigator.pop(context);
-                            },
-                            child: const Text('🇺🇸 English'),
-                          ),
-                          SimpleDialogOption(
-                            onPressed: () {
-                              context.setLocale(const Locale('ru'));
-                              Navigator.pop(context);
-                            },
-                            child: const Text('🇷🇺 Русский'),
-                          ),
-                          SimpleDialogOption(
-                            onPressed: () {
-                              context.setLocale(const Locale('zh', 'CN'));
-                              Navigator.pop(context);
-                            },
-                            child: const Text('🇨🇳 简体中文'),
-                          ),
-                        ],
-                      );
-                    },
-                  );
-                  break;
-                case 'appearance':
-                  Navigator.of(context).push(
-                    MaterialPageRoute(builder: (_) => const AppearanceScreen()),
-                  );
-                  break;
-                case 'logout':
-                  _logout();
-                  break;
-              }
-            },
-            itemBuilder: (BuildContext context) => <PopupMenuEntry<String>>[
-              PopupMenuItem<String>(
-                value: 'user',
-                child: ListTile(
-                  leading: const Icon(Icons.person),
-                  title: Text('menu_user'.tr()),
-                  contentPadding: EdgeInsets.zero,
-                ),
+            onSelected: _onMenu,
+            itemBuilder: (BuildContext context) => [
+              _menuItem('user', Icons.person, 'menu_user'.tr()),
+              _menuItem(
+                'theme',
+                isDark ? Icons.light_mode : Icons.dark_mode,
+                'menu_theme'.tr(),
               ),
-              PopupMenuItem<String>(
-                value: 'theme',
-                child: ListTile(
-                  leading: Icon(
-                    Provider.of<AppProvider>(
-                              context,
-                              listen: false,
-                            ).themeMode ==
-                            ThemeMode.dark
-                        ? Icons.light_mode
-                        : Icons.dark_mode,
-                  ),
-                  title: Text('menu_theme'.tr()),
-                  contentPadding: EdgeInsets.zero,
-                ),
-              ),
-              PopupMenuItem<String>(
-                value: 'appearance',
-                child: ListTile(
-                  leading: const Icon(Icons.view_quilt),
-                  title: Text('appearance'.tr()),
-                  contentPadding: EdgeInsets.zero,
-                ),
-              ),
-              PopupMenuItem<String>(
-                value: 'language',
-                child: ListTile(
-                  leading: const Icon(Icons.language),
-                  title: Text('menu_language'.tr()),
-                  contentPadding: EdgeInsets.zero,
-                ),
-              ),
-              PopupMenuItem<String>(
-                value: 'logout',
-                child: ListTile(
-                  leading: const Icon(Icons.logout),
-                  title: Text(tr('logout')),
-                  contentPadding: EdgeInsets.zero,
-                ),
-              ),
+              _menuItem('appearance', Icons.view_quilt, 'appearance'.tr()),
+              _menuItem('language', Icons.language, 'menu_language'.tr()),
+              const PopupMenuDivider(),
+              _menuItem('logout', Icons.logout, tr('logout')),
             ],
           ),
         ],
@@ -770,9 +701,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
           : _isOffline
           ? _buildOfflineWidget()
           : _error != null
-          ? Center(
-              child: Text(_error!, style: const TextStyle(color: Colors.red)),
-            )
+          ? _buildErrorWidget()
           : RefreshIndicator(
               onRefresh: _fetchSystems,
               child: Builder(
@@ -780,29 +709,30 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   final isDetailed = Provider.of<AppProvider>(
                     context,
                   ).isDetailed;
-                  // In detailed mode, add summary card at index 0
-                  final itemCount = isDetailed
-                      ? _systems.length + 1
-                      : _systems.length;
-
+                  final systems = _visibleSystems;
+                  final header = isDetailed ? 1 : 0;
+                  if (_systems.isEmpty) {
+                    return ListView(
+                      physics: const AlwaysScrollableScrollPhysics(),
+                      children: [
+                        const SizedBox(height: 120),
+                        Center(child: Text(tr('no_systems'))),
+                      ],
+                    );
+                  }
                   return ListView.builder(
                     padding: const EdgeInsets.all(8.0),
                     physics: const AlwaysScrollableScrollPhysics(),
-                    itemCount: itemCount,
+                    itemCount: systems.length + header,
                     itemBuilder: (context, index) {
-                      // Show summary card at index 0 in detailed mode
                       if (isDetailed && index == 0) {
                         return _buildSummaryCard(context);
                       }
-
-                      // Adjust index for systems list
-                      final sysIndex = isDetailed ? index - 1 : index;
-                      final system = _systems[sysIndex];
-                      final traffic = _cumulativeTraffic[system.id];
-                      return _SystemCard(
+                      final system = systems[index - header];
+                      return SystemCard(
                         system: system,
                         isDetailed: isDetailed,
-                        cumulativeTraffic: traffic,
+                        cumulativeTraffic: _cumulativeTraffic[system.id],
                       );
                     },
                   );
@@ -813,366 +743,277 @@ class _DashboardScreenState extends State<DashboardScreen> {
   }
 }
 
-class _SystemCard extends StatelessWidget {
+/// Human readable text for an `alerts_history` entry. Except for network
+/// monitors (actual loss), `value` is the configured threshold.
+String describeHubAlert(HubAlertEvent e) {
+  final v = e.value;
+  final name = e.name;
+  String value;
+  switch (name) {
+    case 'CPU':
+    case 'Memory':
+    case 'Disk':
+    case 'GPU':
+    case 'CPUIOWait':
+    case 'CPUSteal':
+      value = '> ${formatPercent(v)}';
+    case 'Battery':
+      value = '< ${formatPercent(v)}';
+    case 'NetworkMonitorLoss':
+      value = formatPercent(v);
+    case 'Temperature':
+      value = '> ${formatTemp(v)}';
+    case 'Bandwidth':
+      value = '> ${v.toStringAsFixed(2)} MB/s';
+    case 'LoadAvg1':
+    case 'LoadAvg5':
+    case 'LoadAvg15':
+      value = '> ${v.toStringAsFixed(2)}';
+    default:
+      value = '';
+  }
+  final key = 'alert_name_$name';
+  var label = key.tr();
+  if (label == key) label = name;
+  if (e.monitorName.isNotEmpty) label = '$label · ${e.monitorName}';
+  if (value.isEmpty) return label;
+  return name == 'NetworkMonitorLoss' ? '$label: $value' : '$label $value';
+}
+
+class SystemCard extends StatelessWidget {
   final System system;
   final bool isDetailed;
-  final List<int>? cumulativeTraffic; // [sent, recv]
+  final List<double>? cumulativeTraffic; // [sent, recv]
 
-  const _SystemCard({
+  const SystemCard({
+    super.key,
     required this.system,
     this.isDetailed = false,
     this.cumulativeTraffic,
   });
 
-  String _formatBytes(double bytes) {
-    if (bytes <= 0) return '0 B';
-    const suffixes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
-    var i = 0;
-    while (bytes >= 1024 && i < suffixes.length - 1) {
-      bytes /= 1024;
-      i++;
-    }
-    return '${bytes.toStringAsFixed(2)} ${suffixes[i]}';
-  }
-
-  String _formatUptime(int seconds) {
-    if (seconds <= 0) return '-';
-    final days = seconds ~/ 86400;
-    final hours = (seconds % 86400) ~/ 3600;
-    final mins = (seconds % 3600) ~/ 60;
-    if (days > 0) return '${days}d ${hours}h';
-    if (hours > 0) return '${hours}h ${mins}m';
-    return '${mins}m';
-  }
-
-  Color _getStatusColor(double usage) {
-    if (usage < 50) return Colors.green;
-    if (usage < 80) return Colors.orange;
-    return Colors.red;
-  }
-
-  Widget _getOsIcon(String? os) {
-    if (os != null && os.toLowerCase().contains('windows')) {
-      return Image.asset('assets/windows.png', height: 18, width: 18);
-    }
-    // Default to Linux icon for all others (including null) as requested
-    return Image.asset('assets/linux.png', height: 18, width: 18);
+  void _open(BuildContext context) {
+    Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => SystemDetailScreen(system: system)),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    if (isDetailed) return _buildDetailedCard(context);
-    return _buildSimpleCard(context);
-  }
-
-  Widget _buildDetailedCard(BuildContext context) {
-    // Keys from Beszel source (internal/entities/system/system.go):
-    // Info struct (stored in 'systems' collection):
-    //   la: LoadAvg [1m, 5m, 15m] (array of 3 floats)
-    //   sv: Services [total, failed] (array of 2 ints)
-    //   b:  Bandwidth (float64, combined rate in bytes/s)
-    //   bb: BandwidthBytes (uint64, cumulative TOTAL = sent + recv combined)
-    //
-    // Stats struct (stored in 'system_stats' collection):
-    //   b: Bandwidth ([2]uint64 = [sent bytes, recv bytes] cumulative)
-    //   ns/nr: NetworkSent/NetworkRecv (real-time rate, bytes/s)
-
-    String load = '0.00 0.00 0.00';
-    String network = '0 B/s';
-    String services = '0';
-    String totalTraffic = '加载中...'; // Loading...
-    int serviceTotal = 0;
-
-    try {
-      // Load Average (la: [3]float64)
-      if (system.info['la'] != null) {
-        final l = system.info['la'];
-        if (l is List) {
-          load = l
-              .map((v) => (v is num) ? v.toStringAsFixed(2) : v.toString())
-              .join(' ');
-        } else {
-          load = l.toString();
-        }
-      }
-
-      // Real-time Network Speed (bb: combined bytes/s rate)
-      // Note: info['b'] is not set by agent, so we use 'bb' which is bytesSentPerSec + bytesRecvPerSec
-      if (system.info['bb'] != null && system.info['bb'] is num) {
-        final bb = (system.info['bb'] as num).toDouble();
-        network = _formatBytes(bb) + '/s';
-      }
-
-      // Services (sv: [total, failed])
-      int serviceFailed = 0;
-      if (system.info['sv'] != null) {
-        final sv = system.info['sv'];
-        if (sv is List && sv.length >= 1) {
-          serviceTotal = (sv[0] is num) ? (sv[0] as num).toInt() : 0;
-          serviceFailed = (sv.length > 1 && sv[1] is num)
-              ? (sv[1] as num).toInt()
-              : 0;
-          if (serviceTotal > 0) {
-            services = '$serviceTotal (Fail: $serviceFailed)';
-          }
-        }
-      }
-
-      // Total Traffic (from system_stats via cumulativeTraffic)
-      // cumulativeTraffic = [sent, recv] from Stats.b
-      if (cumulativeTraffic != null && cumulativeTraffic!.length >= 2) {
-        final sent = cumulativeTraffic![0];
-        final recv = cumulativeTraffic![1];
-        totalTraffic =
-            '↑${_formatBytes(sent.toDouble())} / ↓${_formatBytes(recv.toDouble())}';
-      } else {
-        // Fallback: use bb (combined total) if cumulativeTraffic not loaded yet
-        if (system.info['bb'] != null && system.info['bb'] is num) {
-          final bb = (system.info['bb'] as num).toDouble();
-          totalTraffic = '总计: ${_formatBytes(bb)}';
-        }
-      }
-    } catch (_) {}
-
-    // Uptime (u: seconds since boot)
-    String uptime = '-';
-    if (system.info['u'] != null && system.info['u'] is num) {
-      uptime = _formatUptime((system.info['u'] as num).toInt());
-    }
-
-    return Card(
-      margin: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
-      elevation: 2,
-      child: InkWell(
-        onTap: () {
-          Navigator.of(context).push(
-            MaterialPageRoute(
-              builder: (_) => SystemDetailScreen(system: system),
-            ),
-          );
-        },
-        onLongPress: () {
-          // Debug: show raw data
-          showDialog(
-            context: context,
-            builder: (_) => AlertDialog(
-              title: Text('Debug: ${system.name}'),
-              content: SingleChildScrollView(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const Text(
-                      '=== info ===',
-                      style: TextStyle(fontWeight: FontWeight.bold),
+    final inactive = !system.isUp;
+    return Opacity(
+      opacity: system.isPaused ? 0.6 : 1,
+      child: Card(
+        margin: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
+        elevation: 1,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(12),
+          onTap: () => _open(context),
+          child: Padding(
+            padding: const EdgeInsets.all(16.0),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _buildHeader(context),
+                if (inactive && system.hasNoData)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 8),
+                    child: Text(
+                      'status_${system.status}_hint'.tr(),
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Theme.of(context).colorScheme.outline,
+                      ),
                     ),
-                    SelectableText(system.info.toString()),
-                    const SizedBox(height: 16),
-                    const Text(
-                      '=== cumulativeTraffic ===',
-                      style: TextStyle(fontWeight: FontWeight.bold),
-                    ),
-                    SelectableText(cumulativeTraffic?.toString() ?? 'null'),
-                  ],
-                ),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.pop(context),
-                  child: const Text('Close'),
-                ),
+                  )
+                else if (isDetailed)
+                  ..._buildDetailed(context)
+                else
+                  ..._buildSimple(context),
               ],
             ),
-          );
-        },
-        child: Padding(
-          padding: const EdgeInsets.all(16.0),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              _buildHeader(detailed: true),
-              const SizedBox(height: 16),
-              _buildProgressBar(
-                context,
-                'CPU',
-                system.cpuPercent,
-                Icons.memory,
-              ),
-              const SizedBox(height: 8),
-              _buildProgressBar(
-                context,
-                'RAM',
-                system.memoryPercent,
-                Icons.storage,
-              ),
-              const SizedBox(height: 8),
-              _buildProgressBar(
-                context,
-                'Disk',
-                system.diskPercent,
-                Icons.donut_large,
-              ),
-              const SizedBox(height: 12),
-              _buildInfoRow(Icons.speed, tr('load'), load),
-              const SizedBox(height: 4),
-              _buildInfoRow(Icons.network_check, tr('network'), network),
-              const SizedBox(height: 4),
-              _buildInfoRow(Icons.data_usage, tr('traffic'), totalTraffic),
-              const SizedBox(height: 4),
-              _buildInfoRow(Icons.schedule, tr('uptime'), uptime),
-              // Only show services row if there are services (non-Docker agent)
-              if (serviceTotal > 0) ...[
-                const SizedBox(height: 4),
-                _buildInfoRow(
-                  Icons.miscellaneous_services,
-                  tr('services'),
-                  services,
-                ),
-              ],
-            ],
           ),
         ),
       ),
     );
   }
 
-  Widget _buildSimpleCard(BuildContext context) {
-    return Card(
-      margin: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
-      elevation: 2,
-      child: InkWell(
-        onTap: () {
-          Navigator.of(context).push(
-            MaterialPageRoute(
-              builder: (_) => SystemDetailScreen(system: system),
-            ),
-          );
-        },
-        child: Padding(
-          padding: const EdgeInsets.all(16.0),
+  Widget _buildHeader(BuildContext context) {
+    final failedServices = system.services.length >= 2
+        ? system.services[1]
+        : 0;
+    return Row(
+      children: [
+        osIcon(system.os),
+        const SizedBox(width: 8),
+        Expanded(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              _buildHeader(detailed: false),
-              const SizedBox(height: 4),
               Text(
-                system.host,
-                style: TextStyle(color: Colors.grey[600], fontSize: 13),
+                system.name,
+                style: const TextStyle(
+                  fontSize: 17,
+                  fontWeight: FontWeight.bold,
+                ),
+                overflow: TextOverflow.ellipsis,
               ),
-              const Divider(height: 24),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceAround,
-                children: [
-                  _buildStat(tr('cpu'), system.cpuPercent, Icons.memory),
-                  _buildStat(tr('ram'), system.memoryPercent, Icons.storage),
-                  _buildStat(tr('disk'), system.diskPercent, Icons.donut_large),
-                ],
-              ),
+              if (!isDetailed)
+                Text(
+                  system.host,
+                  style: TextStyle(
+                    color: Theme.of(context).colorScheme.outline,
+                    fontSize: 12,
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                ),
             ],
           ),
         ),
+        if (failedServices > 0) ...[
+          Pill(
+            text: '$failedServices',
+            color: Colors.red,
+            icon: Icons.miscellaneous_services,
+          ),
+          const SizedBox(width: 6),
+        ],
+        if (system.pendingUpdates.isNotEmpty && system.pendingUpdates[0] > 0) ...[
+          Pill(
+            text: '${system.pendingUpdates[0]}',
+            color: Colors.orange,
+            icon: Icons.system_update_alt,
+          ),
+          const SizedBox(width: 6),
+        ],
+        StatusBadge(status: system.status),
+      ],
+    );
+  }
+
+  List<Widget> _buildSimple(BuildContext context) {
+    final temp = system.temperature;
+    final gpu = system.gpuPercent;
+    return [
+      const Divider(height: 24),
+      Row(
+        mainAxisAlignment: MainAxisAlignment.spaceAround,
+        children: [
+          _stat(tr('cpu'), formatPercent(system.cpuPercent), Icons.memory,
+              usageColor(system.cpuPercent)),
+          _stat(tr('ram'), formatPercent(system.memoryPercent), Icons.storage,
+              usageColor(system.memoryPercent)),
+          _stat(tr('disk'), formatPercent(system.diskPercent),
+              Icons.donut_large, usageColor(system.diskPercent)),
+          if (gpu != null)
+            _stat('GPU', formatPercent(gpu), Icons.videogame_asset_outlined,
+                usageColor(gpu)),
+          if (temp != null)
+            _stat(tr('temp_short'), '${temp.toStringAsFixed(0)}°',
+                Icons.thermostat, tempColor(temp)),
+        ],
       ),
-    );
+    ];
   }
 
-  Widget _buildHeader({required bool detailed}) {
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-      children: [
-        _getOsIcon(system.os),
-        const SizedBox(width: 8),
-        Expanded(
-          child: Text(
-            system.name,
-            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-            overflow: TextOverflow.ellipsis,
-          ),
-        ),
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-          decoration: BoxDecoration(
-            color: system.status == 'up'
-                ? Colors.green.withOpacity(0.2)
-                : Colors.red.withOpacity(0.2),
-            borderRadius: BorderRadius.circular(4),
-          ),
-          child: Text(
-            system.status.toUpperCase(),
-            style: TextStyle(
-              color: system.status == 'up' ? Colors.green : Colors.red,
-              fontWeight: FontWeight.bold,
-              fontSize: 12,
-            ),
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildProgressBar(
-    BuildContext context,
-    String label,
-    double value,
-    IconData icon,
-  ) {
-    final color = _getStatusColor(value);
-    return Row(
-      children: [
-        SizedBox(
-          width: 80,
-          child: Row(
-            children: [
-              Icon(icon, size: 16, color: Colors.grey),
-              const SizedBox(width: 4),
-              Text(label, style: const TextStyle(fontWeight: FontWeight.bold)),
-            ],
-          ),
-        ),
-        Expanded(
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(4),
-            child: LinearProgressIndicator(
-              value: value / 100,
-              color: color,
-              backgroundColor: Colors.grey.withOpacity(0.2),
-              minHeight: 8,
-            ),
-          ),
-        ),
-        const SizedBox(width: 8),
-        SizedBox(
-          width: 40,
-          child: Text(
-            '${value.toStringAsFixed(1)}%',
-            style: const TextStyle(fontSize: 12),
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildInfoRow(IconData icon, String label, String value) {
-    return Row(
-      children: [
-        Icon(icon, size: 16, color: Colors.grey),
-        const SizedBox(width: 8),
-        Text('$label: ', style: const TextStyle(color: Colors.grey)),
-        Text(value, style: const TextStyle(fontWeight: FontWeight.bold)),
-      ],
-    );
-  }
-
-  Widget _buildStat(String label, double value, IconData icon) {
+  Widget _stat(String label, String value, IconData icon, Color color) {
     return Column(
       children: [
-        Icon(icon, color: _getStatusColor(value), size: 24),
+        Icon(icon, color: color, size: 22),
         const SizedBox(height: 4),
         Text(
-          '${value.toStringAsFixed(1)}%',
-          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+          value,
+          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
         ),
-        Text(label, style: const TextStyle(fontSize: 12, color: Colors.grey)),
+        Text(label, style: const TextStyle(fontSize: 11, color: Colors.grey)),
       ],
+    );
+  }
+
+  List<Widget> _buildDetailed(BuildContext context) {
+    final la = system.loadAvg;
+    final services = system.services;
+    final battery = system.battery;
+    String traffic = '-';
+    if (cumulativeTraffic != null && cumulativeTraffic!.length >= 2) {
+      traffic =
+          '↑${formatBytes(cumulativeTraffic![0])} / ↓${formatBytes(cumulativeTraffic![1])}';
+    }
+
+    return [
+      const SizedBox(height: 14),
+      UsageBar(label: 'CPU', percent: system.cpuPercent, icon: Icons.memory),
+      const SizedBox(height: 8),
+      UsageBar(
+        label: tr('ram'),
+        percent: system.memoryPercent,
+        icon: Icons.storage,
+      ),
+      const SizedBox(height: 8),
+      UsageBar(
+        label: system.rootDiskName ?? tr('disk'),
+        percent: system.diskPercent,
+        icon: Icons.donut_large,
+      ),
+      for (final e in system.extraFs.entries) ...[
+        const SizedBox(height: 8),
+        UsageBar(label: e.key, percent: e.value, icon: Icons.donut_large),
+      ],
+      if (system.gpuPercent != null) ...[
+        const SizedBox(height: 8),
+        UsageBar(
+          label: 'GPU',
+          percent: system.gpuPercent!,
+          icon: Icons.videogame_asset_outlined,
+        ),
+      ],
+      const SizedBox(height: 12),
+      if (la.isNotEmpty)
+        _infoRow(
+          Icons.speed,
+          tr('load'),
+          la.map((v) => v.toStringAsFixed(2)).join(' '),
+        ),
+      _infoRow(Icons.network_check, tr('network'), formatBytesRate(system.bandwidth)),
+      if (cumulativeTraffic != null)
+        _infoRow(Icons.data_usage, tr('traffic'), traffic),
+      if (system.temperature != null)
+        _infoRow(Icons.thermostat, tr('temperature'), formatTemp(system.temperature)),
+      if (battery != null)
+        _infoRow(
+          Icons.battery_std,
+          tr('battery'),
+          '${battery.$1}% · ${tr('battery_${battery.$2.name}')}',
+        ),
+      _infoRow(Icons.schedule, tr('uptime'), formatUptime(system.uptime)),
+      if (services.length >= 2 && services[0] > 0)
+        _infoRow(
+          Icons.miscellaneous_services,
+          tr('services'),
+          '${services[0]} (${tr('failed')}: ${services[1]})',
+        ),
+      if (system.agentVersion != null)
+        _infoRow(Icons.sell_outlined, tr('agent_version'), system.agentVersion!),
+    ];
+  }
+
+  Widget _infoRow(IconData icon, String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 4),
+      child: Row(
+        children: [
+          Icon(icon, size: 16, color: Colors.grey),
+          const SizedBox(width: 8),
+          Text('$label: ', style: const TextStyle(color: Colors.grey)),
+          Expanded(
+            child: Text(
+              value,
+              style: const TextStyle(fontWeight: FontWeight.bold),
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

@@ -6,7 +6,7 @@
 
 A cross-platform mobile client for [Beszel](https://github.com/henrygd/beszel), a lightweight server monitoring hub.
 
-This project is a fork of [beszel-android](https://github.com/bayroqdor/beszel-android), enhanced with new features, improved UI, and iOS support.
+Works with Beszel hub 0.21 and older hubs / agents.
 
 ## ✨ Features
 
@@ -18,7 +18,11 @@ This project is a fork of [beszel-android](https://github.com/bayroqdor/beszel-a
 - **Security**: 
   - **PIN Protection**: Secure your app with a 4-digit PIN.
   - **Biometric Auth**: Unlock with Fingerprint or Face ID (iOS & Android).
-- **History**: Interactive charts for CPU, RAM, Disk, and Network usage (up to 24h history or more depending on server).
+- **History**: Interactive charts with Live, 1h, 12h, 24h, 1 week and 30 day ranges.
+- **Everything Beszel collects**: extra disks, S.M.A.R.T., ZFS/btrfs pools, temperatures, fans, batteries, GPUs, Docker/Podman containers (with logs), systemd services (with logs), pending package updates.
+- **Hub alerts**: active / resolved alert history, alert rules and notifications.
+- **Sign-in**: password, MFA one-time codes, OTP-only and OAuth2 / OIDC.
+- **Private networks**: any host name (`.internal`, `.lan`, `.home.arpa`, IPs, ports, sub-paths) and trust-on-first-use for self-signed or mkcert certificates.
 - **Multi-OS Support**: Optimized for Android and iOS (iOS 14+ compatible).
 - **TrollStore Support**: Native support for generating unsigned IPAs for TrollStore users.
 
@@ -33,11 +37,11 @@ This project is a fork of [beszel-android](https://github.com/bayroqdor/beszel-a
 ## 📥 Installation
 
 ### Android
-Download the latest APK from [Releases](https://github.com/PTPAAA/beszel-mobile/releases).
+Download the latest APK from [Releases](https://github.com/bayroqdor/beszel-android/releases).
 
 ### iOS
 #### TrollStore Users
-1. Download the `Beszel.ipa` from [Releases](https://github.com/PTPAAA/beszel-mobile/releases).
+1. Download the `Beszel.ipa` from [Releases](https://github.com/bayroqdor/beszel-android/releases).
 2. Install via TrollStore.
 
 #### Standard Installation
@@ -75,10 +79,11 @@ Supported languages:
 - 🇺🇸 English
 - 🇨🇳 Chinese (Simplified)
 - 🇷🇺 Russian
+- 🇺🇿 Uzbek
 
 ## 🤝 Credits
 - [Beszel](https://github.com/henrygd/beszel) - The amazing server monitoring hub.
-- [beszel-android](https://github.com/bayroqdor/beszel-android) - The original Android client project.
+- [PTPAAA](https://github.com/PTPAAA) - iOS support, detailed view and Chinese translation.
 
 ## 📄 License
 MIT License

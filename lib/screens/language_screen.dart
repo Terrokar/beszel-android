@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:easy_localization/easy_localization.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:beszel_pro/screens/setup_screen.dart';
+import 'package:beszel_pro/widgets/language_menu.dart';
 
 class LanguageScreen extends StatelessWidget {
   const LanguageScreen({super.key});
@@ -12,6 +13,7 @@ class LanguageScreen extends StatelessWidget {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('is_first_run', false);
 
+    if (!context.mounted) return;
     Navigator.of(
       context,
     ).push(MaterialPageRoute(builder: (_) => const SetupScreen()));
@@ -30,21 +32,13 @@ class LanguageScreen extends StatelessWidget {
             children: [
               const Icon(Icons.language, size: 80, color: Colors.blueAccent),
               const SizedBox(height: 48),
-              _LanguageOption(
-                label: '🇺🇸 English',
-                onPressed: () => _selectLanguage(context, const Locale('en')),
-              ),
-              const SizedBox(height: 16),
-              _LanguageOption(
-                label: '🇨🇳 简体中文',
-                onPressed: () =>
-                    _selectLanguage(context, const Locale('zh', 'CN')),
-              ),
-              const SizedBox(height: 16),
-              _LanguageOption(
-                label: '🇷🇺 Русский',
-                onPressed: () => _selectLanguage(context, const Locale('ru')),
-              ),
+              for (final lang in supportedLanguages) ...[
+                _LanguageOption(
+                  label: lang.label,
+                  onPressed: () => _selectLanguage(context, lang.locale),
+                ),
+                const SizedBox(height: 16),
+              ],
             ],
           ),
         ),
