@@ -11,6 +11,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:beszel_pro/services/pin_service.dart';
 import 'package:beszel_pro/screens/pin_screen.dart';
 import 'package:beszel_pro/services/alert_manager.dart';
+import 'package:beszel_pro/widgets/language_menu.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -19,7 +20,7 @@ void main() async {
 
   runApp(
     EasyLocalization(
-      supportedLocales: const [Locale('en'), Locale('ru'), Locale('zh', 'CN')],
+      supportedLocales: supportedLocales,
       path: 'assets/translations',
       fallbackLocale: const Locale('en'),
       child: MultiProvider(

@@ -7,9 +7,16 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 class AppearanceScreen extends StatelessWidget {
-  const AppearanceScreen({super.key});
+  /// Opened from the dashboard menu instead of the onboarding flow.
+  final bool fromSettings;
+
+  const AppearanceScreen({super.key, this.fromSettings = false});
 
   Future<void> _next(BuildContext context) async {
+    if (fromSettings) {
+      Navigator.of(context).pop();
+      return;
+    }
     final isPinSet = await PinService().isPinSet();
     if (!context.mounted) return;
 
@@ -44,7 +51,7 @@ class AppearanceScreen extends StatelessWidget {
             Expanded(
               child: Consumer<AppProvider>(
                 builder: (context, provider, _) {
-                  return Column(
+                  return ListView(
                     children: [
                       _buildOption(
                         context,
@@ -61,6 +68,37 @@ class AppearanceScreen extends StatelessWidget {
                         isSelected: provider.isDetailed,
                         onTap: () => provider.setDetailedMode(true),
                       ),
+                      const SizedBox(height: 32),
+                      Text(
+                        'menu_theme'.tr(),
+                        style: const TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      SegmentedButton<ThemeMode>(
+                        segments: [
+                          ButtonSegment(
+                            value: ThemeMode.system,
+                            icon: const Icon(Icons.brightness_auto),
+                            label: Text('theme_system'.tr()),
+                          ),
+                          ButtonSegment(
+                            value: ThemeMode.light,
+                            icon: const Icon(Icons.light_mode),
+                            label: Text('theme_light'.tr()),
+                          ),
+                          ButtonSegment(
+                            value: ThemeMode.dark,
+                            icon: const Icon(Icons.dark_mode),
+                            label: Text('theme_dark'.tr()),
+                          ),
+                        ],
+                        selected: {provider.themeMode},
+                        onSelectionChanged: (s) =>
+                            provider.setThemeMode(s.first),
+                      ),
                     ],
                   );
                 },
@@ -71,7 +109,7 @@ class AppearanceScreen extends StatelessWidget {
               style: ElevatedButton.styleFrom(
                 padding: const EdgeInsets.symmetric(vertical: 16),
               ),
-              child: Text('continue'.tr()),
+              child: Text(fromSettings ? 'done'.tr() : 'continue'.tr()),
             ),
           ],
         ),

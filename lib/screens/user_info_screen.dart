@@ -4,7 +4,8 @@ import 'package:easy_localization/easy_localization.dart';
 import 'package:beszel_pro/screens/pin_screen.dart';
 import 'package:beszel_pro/services/pin_service.dart';
 import 'package:beszel_pro/services/biometric_service.dart';
-import 'package:pocketbase/pocketbase.dart';
+import 'package:beszel_pro/services/beszel_api.dart';
+import 'package:beszel_pro/screens/dashboard_screen.dart' show performLogout;
 
 class UserInfoScreen extends StatefulWidget {
   const UserInfoScreen({super.key});
@@ -15,6 +16,9 @@ class UserInfoScreen extends StatefulWidget {
 
 class _UserInfoScreenState extends State<UserInfoScreen> {
   String _email = '';
+  String _role = '';
+  String _serverUrl = '';
+  String? _hubVersion;
   bool _isPinSet = false;
   bool _biometricAvailable = false;
   bool _biometricEnabled = false;
@@ -29,15 +33,19 @@ class _UserInfoScreenState extends State<UserInfoScreen> {
   }
 
   void _loadUser() {
-    final model = PocketBaseService().pb.authStore.model;
-    if (model is RecordModel) {
-      _email = model.data['email'] ?? model.id;
-    } else {
-      try {
-        _email = (model as dynamic)?.email ?? '';
-      } catch (_) {}
+    final pb = PocketBaseService().pb;
+    final record = pb.authStore.record;
+    if (record != null) {
+      _email = record.getStringValue('email', record.id);
+      _role = record.getStringValue('role');
     }
-    setState(() {});
+    _serverUrl = pb.baseURL;
+    BeszelApi()
+        .hubInfo()
+        .then((info) {
+          if (mounted) setState(() => _hubVersion = info['v']?.toString());
+        })
+        .catchError((_) {});
   }
 
   Future<void> _loadSettings() async {
@@ -152,7 +160,26 @@ class _UserInfoScreenState extends State<UserInfoScreen> {
           Center(
             child: Text(_email, style: Theme.of(context).textTheme.titleLarge),
           ),
-          const SizedBox(height: 32),
+          if (_role.isNotEmpty)
+            Center(
+              child: Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Chip(label: Text(_role)),
+              ),
+            ),
+          const SizedBox(height: 24),
+          const Divider(),
+          ListTile(
+            leading: const Icon(Icons.dns_outlined),
+            title: Text(tr('server_url')),
+            subtitle: SelectableText(_serverUrl),
+          ),
+          if (_hubVersion != null)
+            ListTile(
+              leading: const Icon(Icons.sell_outlined),
+              title: Text(tr('hub_version')),
+              subtitle: Text(_hubVersion!),
+            ),
           const Divider(),
           // PIN Code
           ListTile(
@@ -181,6 +208,19 @@ class _UserInfoScreenState extends State<UserInfoScreen> {
                 onChanged: _handleBiometricToggle,
               ),
             ),
+          const Divider(),
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: OutlinedButton.icon(
+              style: OutlinedButton.styleFrom(
+                foregroundColor: Colors.red,
+                padding: const EdgeInsets.symmetric(vertical: 14),
+              ),
+              onPressed: () => performLogout(context),
+              icon: const Icon(Icons.logout),
+              label: Text(tr('logout')),
+            ),
+          ),
         ],
       ),
     );
